@@ -3434,11 +3434,40 @@ BoolMask KeyCondition::checkInHyperrectangle(
             element.function == RPNElement::FUNCTION_IS_NULL
             || element.function == RPNElement::FUNCTION_IS_NOT_NULL)
         {
-            const Range * key_range = &hyperrectangle[element.getKeyColumn()];
+            size_t key_column = element.getKeyColumn();
+            if (key_column >= hyperrectangle.size())
+            {
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Hyperrectangle size is {}, but requested element at position {} ({})",
+                    hyperrectangle.size(),
+                    key_column,
+                    element.toString());
+            }
+
+            Range key_range = hyperrectangle[key_column];
+
+            if (element.argument_num_of_tuple_function)
+            {
+                const auto tuple_element_index = *element.argument_num_of_tuple_function;
+
+                auto maybe_projected = key_range.projectTupleComponent(tuple_element_index);
+                if (!maybe_projected.has_value())
+                {
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Cannot project range {} to tuple element at index {} for key condition element {}",
+                        key_range.toString(),
+                        tuple_element_index,
+                        element.toString());
+                }
+
+                key_range = *maybe_projected;
+            }
 
             /// No need to apply monotonic functions as nulls are kept.
-            bool intersects = element.range.intersectsRange(*key_range);
-            bool contains = element.range.containsRange(*key_range);
+            bool intersects = element.range.intersectsRange(key_range);
+            bool contains = element.range.containsRange(key_range);
 
             rpn_stack.emplace_back(intersects, !contains);
             if (element.function == RPNElement::FUNCTION_IS_NULL)
