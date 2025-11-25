@@ -3676,6 +3676,9 @@ String KeyCondition::RPNElement::toString(const std::vector<String> & key_names)
             buf << "column " << key_column;
         else
             buf << key_names.at(key_column);
+
+        if (argument_num_of_tuple_function)
+            buf << "[" << *argument_num_of_tuple_function << "]";
     };
 
     auto print_wrapped_columns = [&]()
