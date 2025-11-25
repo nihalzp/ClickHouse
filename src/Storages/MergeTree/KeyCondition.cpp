@@ -3596,7 +3596,28 @@ void KeyCondition::prepareBloomFilterData(std::function<std::optional<uint64_t>(
                 continue;
             }
 
-            auto hashed_value = hash_one(rpn_element.getKeyColumn(), rpn_element.range.left);
+            Field value = rpn_element.range.left;
+
+            /// If Key is tuple, we need to extract the INPUT column from the tuple and hash only that
+            if (rpn_element.argument_num_of_tuple_function)
+            {
+                const auto tuple_element_index = *rpn_element.argument_num_of_tuple_function;
+
+                if (value.getType() == Field::Types::Tuple)
+                {
+                    const auto & tuple = value.safeGet<Tuple>();
+                    if (tuple_element_index >= tuple.size())
+                        throw Exception(
+                            ErrorCodes::LOGICAL_ERROR,
+                            "Tuple element index {} is out of bounds for tuple of size {} in key condition element",
+                            tuple_element_index,
+                            tuple.size());
+
+                    value = tuple[tuple_element_index];
+                }
+            }
+
+            auto hashed_value = hash_one(rpn_element.getKeyColumn(), value);
 
             if (!hashed_value)
             {
