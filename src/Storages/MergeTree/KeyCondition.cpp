@@ -40,7 +40,6 @@
 #include <algorithm>
 #include <cassert>
 #include <stack>
-#include <limits>
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/geometries/polygon.hpp>
@@ -840,6 +839,35 @@ void KeyCondition::getAllSpaceFillingCurves(const BuildInfo & info)
     }
 }
 
+void KeyCondition::getAllTupleKeyColumns(const BuildInfo & info)
+{
+    for (const auto & action : info.key_expr->getActions())
+    {
+        if (action.node->type == ActionsDAG::ActionType::FUNCTION
+            && action.node->function_base->getName() == "tuple")
+        {
+            TupleKeyDescription tuple_key;
+            tuple_key.key_column_pos = key_columns.at(action.node->result_name);
+            for (const auto & child : action.node->children)
+            {
+                /// For now, require all arguments to be regular input columns
+                if (child->type == ActionsDAG::ActionType::INPUT)
+                {
+                    tuple_key.arguments.push_back(child->result_name);
+                }
+                else
+                {
+                    tuple_key.arguments.clear();
+                    break;
+                }
+            }
+
+            if (!tuple_key.arguments.empty())
+                tuple_keys.push_back(std::move(tuple_key));
+        }
+    }
+}
+
 ActionsDAGWithInversionPushDown::ActionsDAGWithInversionPushDown(const ActionsDAG::Node * predicate_, const ContextPtr & context)
 {
     if (!predicate_)
@@ -879,6 +907,8 @@ KeyCondition::KeyCondition(
 
     if (context->getSettingsRef()[Setting::analyze_index_with_space_filling_curves])
         getAllSpaceFillingCurves(info);
+
+    getAllTupleKeyColumns(info);
 
     if (!filter_dag.predicate)
     {
@@ -1233,10 +1263,11 @@ bool KeyCondition::tryPrepareSetIndex(
         index_mapping.tuple_index = tuple_index;
         DataTypePtr data_type;
         std::optional<size_t> key_space_filling_curve_argument_pos;
+        std::optional<size_t> argument_num_of_tuple_function;
         MonotonicFunctionsChain set_transforming_chain;
         if (isKeyPossiblyWrappedByMonotonicFunctions(
-                node, info, index_mapping.key_index, key_space_filling_curve_argument_pos, data_type, index_mapping.functions)
-            && !key_space_filling_curve_argument_pos) /// We don't support the analysis of space-filling curves and IN set.
+                node, info, index_mapping.key_index, key_space_filling_curve_argument_pos, argument_num_of_tuple_function, data_type, index_mapping.functions)
+            && !key_space_filling_curve_argument_pos && !argument_num_of_tuple_function) /// We don't support the analysis of space-filling curves and IN set.
         {
             indexes_mapping.push_back(index_mapping);
             data_types.push_back(data_type);
@@ -1576,6 +1607,7 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctions(
     const BuildInfo & info,
     size_t & out_key_column_num,
     std::optional<size_t> & out_argument_num_of_space_filling_curve,
+    std::optional<size_t> & out_argument_num_of_tuple_function,
     DataTypePtr & out_key_res_column_type,
     MonotonicFunctionsChain & out_functions_chain,
     bool assume_function_monotonicity)
@@ -1584,7 +1616,7 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctions(
     DataTypePtr key_column_type;
 
     if (!isKeyPossiblyWrappedByMonotonicFunctionsImpl(
-        node, info, out_key_column_num, out_argument_num_of_space_filling_curve, key_column_type, chain_not_tested_for_monotonicity))
+        node, info, out_key_column_num, out_argument_num_of_space_filling_curve, out_argument_num_of_tuple_function, key_column_type, chain_not_tested_for_monotonicity))
         return false;
 
     for (auto it = chain_not_tested_for_monotonicity.rbegin(); it != chain_not_tested_for_monotonicity.rend(); ++it)
@@ -1644,6 +1676,7 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctionsImpl(
     const BuildInfo & info,
     size_t & out_key_column_num,
     std::optional<size_t> & out_argument_num_of_space_filling_curve,
+    std::optional<size_t> & out_argument_num_of_tuple_function,
     DataTypePtr & out_key_column_type,
     std::vector<RPNBuilderFunctionTreeNode> & out_functions_chain)
 {
@@ -1661,6 +1694,20 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctionsImpl(
         out_key_column_num = it->second;
         out_key_column_type = sample_block.getByName(name).type;
         return true;
+    }
+
+    for (auto & tuple_info : tuple_keys)
+    {
+        for (size_t i = 0; i < tuple_info.arguments.size(); ++i)
+        {
+            if (tuple_info.arguments[i] == name)
+            {
+                out_key_column_num = tuple_info.key_column_pos;
+                out_argument_num_of_tuple_function = i;
+                out_key_column_type = sample_block.getByName(name).type;
+                return true;
+            }
+        }
     }
 
     /** The case of space-filling curves.
@@ -1710,6 +1757,7 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctionsImpl(
                     info,
                     out_key_column_num,
                     out_argument_num_of_space_filling_curve,
+                    out_argument_num_of_tuple_function,
                     out_key_column_type,
                     out_functions_chain);
             }
@@ -1720,6 +1768,7 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctionsImpl(
                     info,
                     out_key_column_num,
                     out_argument_num_of_space_filling_curve,
+                    out_argument_num_of_tuple_function,
                     out_key_column_type,
                     out_functions_chain);
             }
@@ -1731,6 +1780,7 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctionsImpl(
                 info,
                 out_key_column_num,
                 out_argument_num_of_space_filling_curve,
+                out_argument_num_of_tuple_function,
                 out_key_column_type,
                 out_functions_chain);
         }
@@ -2005,6 +2055,8 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
         /// For example, if the key is mortonEncode(x, y), and the atom is x, then the argument num is 0.
         std::optional<size_t> argument_num_of_space_filling_curve;
 
+        std::optional<size_t> argument_num_of_tuple_function;
+
         MonotonicFunctionsChain chain;
         std::string func_name = func.getFunctionName();
 
@@ -2064,7 +2116,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
         if (num_args == 1)
         {
             if (!(isKeyPossiblyWrappedByMonotonicFunctions(
-                func.getArgumentAt(0), info, key_column_num, argument_num_of_space_filling_curve, key_expr_type, chain)))
+                func.getArgumentAt(0), info, key_column_num, argument_num_of_space_filling_curve, argument_num_of_tuple_function, key_expr_type, chain)))
                 return false;
 
             if (key_column_num == static_cast<size_t>(-1))
@@ -2117,6 +2169,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
                     info,
                     key_column_num,
                     argument_num_of_space_filling_curve,
+                    argument_num_of_tuple_function,
                     key_expr_type,
                     chain,
                     single_point && func_name == "equals"))
@@ -2246,6 +2299,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
         out.key_columns.push_back(key_column_num);
         out.monotonic_functions_chain = std::move(chain);
         out.argument_num_of_space_filling_curve = argument_num_of_space_filling_curve;
+        out.argument_num_of_tuple_function = argument_num_of_tuple_function;
 
         bool valid_atom = atom_it->second(out, const_value);
         if (valid_atom && out.relaxed)
@@ -3156,6 +3210,45 @@ BoolMask KeyCondition::checkInHyperrectangle(
             }
 
             Range key_range = hyperrectangle[key_column];
+            DataTypePtr key_type = data_types[key_column];
+
+            if (element.argument_num_of_tuple_function)
+            {
+                const auto tuple_element_index = *element.argument_num_of_tuple_function;
+
+                auto maybe_key_range = key_range.projectTupleComponent(tuple_element_index);
+
+                if (!maybe_key_range.has_value())
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Cannot project range {} to tuple element at index {} for key condition element {}",
+                        key_range.toString(),
+                        tuple_element_index,
+                        element.toString());
+
+                key_range = *maybe_key_range;
+
+                const auto * tuple_type = typeid_cast<const DataTypeTuple *>(key_type.get());
+
+                if (!tuple_type)
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Expected tuple type for key condition element {}, but got {}",
+                        element.toString(),
+                        key_type->getName());
+
+                const auto & tuple_elements = tuple_type->getElements();
+
+                if (tuple_element_index >= tuple_elements.size())
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Tuple element index {} is out of bounds for tuple of size {} in key condition element {}",
+                        tuple_element_index,
+                        tuple_elements.size(),
+                        element.toString());
+
+                key_type = tuple_elements[tuple_element_index];
+            }
 
             /// The case when the column is wrapped in a chain of possibly monotonic functions.
             if (!element.monotonic_functions_chain.empty())
@@ -3163,7 +3256,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                 std::optional<Range> new_range = applyMonotonicFunctionsChainToRange(
                     key_range,
                     element.monotonic_functions_chain,
-                    data_types[key_column],
+                    key_type,
                     single_point
                 );
 
