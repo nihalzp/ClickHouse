@@ -688,11 +688,53 @@ BoolMask MergeTreeSetIndex::checkInRange(const std::vector<Range> & key_ranges, 
     ranges.reserve(tuple_size);
     for (size_t i = 0; i < tuple_size; ++i)
     {
-        std::optional<Range> new_range = KeyCondition::applyMonotonicFunctionsChainToRange(
-            key_ranges[indexes_mapping[i].key_index],
-            indexes_mapping[i].functions,
-            data_types[indexes_mapping[i].key_index],
-            single_point);
+        const auto & mapping = indexes_mapping[i];
+
+        Range key_range = key_ranges[mapping.key_index];
+        DataTypePtr key_type = data_types[mapping.key_index];
+
+        /// In the event the key itself is a tuple, we need to project the range to the appropriate element
+        /// ORDER BY (a, (b, c))
+        /// WHERE b IN [2, 3]
+        /// For example, here: key_type would be Tuple(type(b), type(c)), and we need to project to element 0 (b)
+        /// of that tuple.
+        if (mapping.tuple_key_element_index)
+        {
+            const size_t tuple_element_index = *mapping.tuple_key_element_index;
+
+            auto maybe_projected = key_range.projectTupleComponent(tuple_element_index);
+
+            if (!maybe_projected)
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Cannot project range {} to tuple element at index {}",
+                    key_range.toString(),
+                    tuple_element_index);
+
+            key_range = *maybe_projected;
+
+            const auto * tuple_type = typeid_cast<const DataTypeTuple *>(key_type.get());
+            if (!tuple_type)
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Expected tuple type for key condition element {}, but got {}",
+                    mapping.key_index,
+                    key_type->getName());
+
+            const auto & tuple_elements = tuple_type->getElements();
+            if (tuple_element_index >= tuple_elements.size())
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Tuple element index {} is out of bounds for tuple of size {}",
+                    tuple_element_index,
+                    tuple_elements.size());
+
+            key_type = tuple_elements[tuple_element_index];
+        }
+
+
+        std::optional<Range> new_range
+            = KeyCondition::applyMonotonicFunctionsChainToRange(key_range, indexes_mapping[i].functions, key_type, single_point);
 
         if (!new_range)
             return {true, true};

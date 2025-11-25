@@ -1267,8 +1267,9 @@ bool KeyCondition::tryPrepareSetIndex(
         MonotonicFunctionsChain set_transforming_chain;
         if (isKeyPossiblyWrappedByMonotonicFunctions(
                 node, info, index_mapping.key_index, key_space_filling_curve_argument_pos, argument_num_of_tuple_function, data_type, index_mapping.functions)
-            && !key_space_filling_curve_argument_pos && !argument_num_of_tuple_function) /// We don't support the analysis of space-filling curves and IN set.
+            && !key_space_filling_curve_argument_pos) /// We don't support the analysis of space-filling curves and IN set.
         {
+            index_mapping.tuple_key_element_index = argument_num_of_tuple_function;
             indexes_mapping.push_back(index_mapping);
             data_types.push_back(data_type);
             set_transforming_chains.push_back(set_transforming_chain);
@@ -3216,9 +3217,9 @@ BoolMask KeyCondition::checkInHyperrectangle(
             {
                 const auto tuple_element_index = *element.argument_num_of_tuple_function;
 
-                auto maybe_key_range = key_range.projectTupleComponent(tuple_element_index);
+                auto maybe_projected = key_range.projectTupleComponent(tuple_element_index);
 
-                if (!maybe_key_range.has_value())
+                if (!maybe_projected.has_value())
                     throw Exception(
                         ErrorCodes::LOGICAL_ERROR,
                         "Cannot project range {} to tuple element at index {} for key condition element {}",
@@ -3226,7 +3227,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                         tuple_element_index,
                         element.toString());
 
-                key_range = *maybe_key_range;
+                key_range = *maybe_projected;
 
                 const auto * tuple_type = typeid_cast<const DataTypeTuple *>(key_type.get());
 

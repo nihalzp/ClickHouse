@@ -212,6 +212,10 @@ public:
         size_t tuple_index;
         size_t key_index;
         std::vector<FunctionBasePtr> functions;
+
+        /// key_index might point to a key that is a tuple itself. In that case,
+        /// tuple_key_element_index indicates the position inside that tuple.
+        std::optional<size_t> tuple_key_element_index;
     };
 
     MergeTreeSetIndex(const Columns & set_elements, std::vector<KeyTuplePositionMapping> && indexes_mapping_);
