@@ -242,7 +242,7 @@ std::optional<Range> Range::projectTupleComponent(size_t i) const
         FieldRef left_i(left_tuple[i]);
         FieldRef right_i(right_tuple[i]);
 
-        return Range(left_i, left_included, right_i, right_included);
+        return Range(left_i, true, right_i, true);
     }
 
     /// Case 3: (-inf, tuple] -> assume  ((-inf, -inf, ...), tuple].
@@ -256,7 +256,7 @@ std::optional<Range> Range::projectTupleComponent(size_t i) const
         FieldRef left_i(left); /// still -inf
         FieldRef right_i(right_tuple[i]);
 
-        return Range(left_i, left_included, right_i, right_included);
+        return Range(left_i, false, right_i, true);
     }
 
     /// Case 4: [tuple, +inf) -> assume [tuple, (+inf, +inf, ...))
@@ -271,7 +271,7 @@ std::optional<Range> Range::projectTupleComponent(size_t i) const
 
         FieldRef right_i(right); /// still +inf
 
-        return Range(left_i, left_included, right_i, right_included);
+        return Range(left_i, true, right_i, false);
     }
 
     return std::nullopt;
