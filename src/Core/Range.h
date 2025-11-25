@@ -106,6 +106,13 @@ public:
     ///     [1, 3] -> (-inf, 1), (3, +inf)
     Ranges invertRange() const;
 
+    /// Project the i-th component of tuple range.
+    /// Returns nullopt if not possible.
+    /// Example:
+    ///    for i = 1,
+    ///    [(1, 'a'), (3, 'c')]  ->  ['a', 'c']
+    std::optional<Range> projectTupleComponent(size_t i) const;
+
     std::optional<Range> intersectWith(const Range & r) const;
     std::optional<Range> unionWith(const Range & r) const;
 

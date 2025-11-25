@@ -221,6 +221,62 @@ Ranges Range::invertRange() const
     return ranges;
 }
 
+std::optional<Range> Range::projectTupleComponent(size_t i) const
+{
+    /// Case 1: (-inf, +inf)
+    if (isInfinite())
+        return *this;
+
+    const auto left_type = left.getType();
+    const auto right_type = right.getType();
+
+    /// Case 2: both bounds are tuples
+    if (left_type == Field::Types::Tuple && right_type == Field::Types::Tuple)
+    {
+        const auto & left_tuple = left.safeGet<Tuple>();
+        const auto & right_tuple = right.safeGet<Tuple>();
+
+        if (i >= left_tuple.size() || i >= right_tuple.size())
+            return std::nullopt;
+
+        FieldRef left_i(left_tuple[i]);
+        FieldRef right_i(right_tuple[i]);
+
+        return Range(left_i, left_included, right_i, right_included);
+    }
+
+    /// Case 3: (-inf, tuple] -> assume  ((-inf, -inf, ...), tuple].
+    if (left.isNegativeInfinity() && right_type == Field::Types::Tuple)
+    {
+        const auto & right_tuple = right.safeGet<Tuple>();
+
+        if (i >= right_tuple.size())
+            return std::nullopt;
+
+        FieldRef left_i(left); /// still -inf
+        FieldRef right_i(right_tuple[i]);
+
+        return Range(left_i, left_included, right_i, right_included);
+    }
+
+    /// Case 4: [tuple, +inf) -> assume [tuple, (+inf, +inf, ...))
+    if (right.isPositiveInfinity() && left_type == Field::Types::Tuple)
+    {
+        const auto & left_tuple = left.safeGet<Tuple>();
+
+        if (i >= left_tuple.size())
+            return std::nullopt;
+
+        FieldRef left_i(left_tuple[i]);
+
+        FieldRef right_i(right); /// still +inf
+
+        return Range(left_i, left_included, right_i, right_included);
+    }
+
+    return std::nullopt;
+}
+
 std::optional<Range> Range::intersectWith(const Range & r) const
 {
     if (!intersectsRange(r))
