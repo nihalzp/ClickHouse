@@ -246,8 +246,6 @@ public:
         /// on the key column directly (see findHyperrectanglesForArgumentsOfSpaceFillingCurves).
         std::optional<size_t> argument_num_of_space_filling_curve;
 
-        std::optional<size_t> argument_num_of_tuple_function;
-
         /// For FUNCTION_IN_SET, FUNCTION_NOT_IN_SET
         using MergeTreeSetIndexPtr = std::shared_ptr<const MergeTreeSetIndex>;
         MergeTreeSetIndexPtr set_index;
@@ -341,7 +339,6 @@ private:
         const BuildInfo & info,
         size_t & out_key_column_num,
         std::optional<size_t> & out_argument_num_of_space_filling_curve,
-        std::optional<size_t> & out_argument_num_of_tuple_function,
         DataTypePtr & out_key_res_column_type,
         MonotonicFunctionsChain & out_functions_chain,
         bool assume_function_monotonicity = false);
@@ -351,7 +348,6 @@ private:
         const BuildInfo & info,
         size_t & out_key_column_num,
         std::optional<size_t> & out_argument_num_of_space_filling_curve,
-        std::optional<size_t> & out_argument_num_of_tuple_function,
         DataTypePtr & out_key_column_type,
         std::vector<RPNBuilderFunctionTreeNode> & out_functions_chain);
 
@@ -432,8 +428,6 @@ private:
 
     void getAllSpaceFillingCurves(const BuildInfo & info);
 
-    void getAllTupleKeyColumns(const BuildInfo & info);
-
     /// Determines if a function maintains monotonicity.
     /// Currently only does special checks for toDateTime monotonicity.
     bool isFunctionReallyMonotonic(const IFunctionBase & func, const IDataType & arg_type) const;
@@ -473,15 +467,6 @@ private:
     };
     using SpaceFillingCurveDescriptions = std::vector<SpaceFillingCurveDescription>;
     SpaceFillingCurveDescriptions key_space_filling_curves;
-
-    struct TupleKeyDescription
-    {
-        size_t key_column_pos;
-        std::vector<String> arguments;
-    };
-
-    using TupleKeyDescriptions = std::vector<TupleKeyDescription>;
-    TupleKeyDescriptions tuple_keys;
 
     /// If true, this key condition is used only to validate single value
     /// ranges. It permits key_expr and constant of FunctionEquals to be
