@@ -921,7 +921,10 @@ KeyCondition::KeyCondition(
     , date_time_overflow_behavior_ignore(
           context->getSettingsRef()[Setting::date_time_overflow_behavior] == FormatSettings::DateTimeOverflowBehavior::Ignore)
 {
+    num_flattened_key_columns = flattenTupleKeyColumnFromKeyExpr(key_column_names_, key_expr_, flattened_key_columns);
+
     auto info = BuildInfo {.key_expr = key_expr_, .key_subexpr_names = getAllSubexpressionNames(*key_expr_)};
+
     size_t key_index = 0;
     for (const auto & name : key_column_names_)
     {
@@ -964,7 +967,13 @@ KeyCondition::KeyCondition(
     , single_point(single_point_)
     , date_time_overflow_behavior_ignore(date_time_overflow_behavior_ignore_)
     , relaxed(relaxed_)
-{}
+{
+    Names key_column_names;
+    key_column_names.resize(key_columns.size());
+    for (const auto & [name, index] : key_columns)
+        key_column_names[index] = name;
+    num_flattened_key_columns = flattenTupleKeyColumnFromKeyExpr(key_column_names, nullptr, flattened_key_columns);
+}
 
 bool KeyCondition::addCondition(const String & column, const Range & range)
 {
