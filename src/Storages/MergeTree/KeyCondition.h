@@ -444,10 +444,23 @@ private:
     /// This flag identify whether there are filters.
     bool has_filter;
 
+    /// Map from key column name to its index in the Primary Key.
+    /// For example, for key columns (a, tuple(b, c)), key_columns will be:
+    /// Mapping: ["a" -> 0, "tuple(b, c)" -> 1]
     ColumnIndices key_columns;
+
+    /// Map from INPUT key column name to its index in the flattened key columns.
+    /// For example, for key columns (a, tuple(b, c)), flattened_key_columns will be (a, b, c).
+    /// Mapping: ["a" -> 0, "b" -> 1, "c" -> 2]
+    ColumnIndices flattened_key_columns;
+
     /// `key_columns` may contain all columns of the key tuple or only the columns used in the
     /// KeyCondition. Either way, num_key_columns is the length of the whole key tuple.
     size_t num_key_columns = 0;
+
+    /// Number of flattened key columns (i.e., after expanding tuple columns).
+    /// (a, (a, b, (c, f(a)))) -> 5
+    size_t num_flattened_key_columns = 0;
 
     /// Space-filling curves in the key
     enum class SpaceFillingCurveType
