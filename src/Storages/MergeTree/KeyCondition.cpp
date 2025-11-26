@@ -3178,11 +3178,62 @@ bool KeyCondition::extractPlainRanges(Ranges & ranges) const
     return true;
 }
 
+static void
+flattenRangeAndType(const DB::Range & range, const DB::DataTypePtr & type, DB::Hyperrectangle & out_ranges, DB::DataTypes & out_types)
+{
+    const auto * tuple_type = typeid_cast<const DB::DataTypeTuple *>(type.get());
+    if (!tuple_type)
+    {
+        out_ranges.push_back(range);
+        out_types.push_back(type);
+        return;
+    }
+
+    const auto & elements = tuple_type->getElements();
+    const size_t tuple_size = elements.size();
+
+    // For each tuple element, project the component and recurse if it's a nested tuple
+    for (size_t i = 0; i < tuple_size; ++i)
+    {
+        auto maybe_proj = range.projectTupleComponent(i);
+
+        chassert(maybe_proj.has_value());
+
+        const auto & elem_type = elements[i];
+
+        // Recurse to handle nested tuples like (b, (c, d))
+        flattenRangeAndType(*maybe_proj, elem_type, out_ranges, out_types);
+    }
+}
+
+static void flattenHyperrectangleAndTypes(
+    const DB::Hyperrectangle & in_hyperrectangle,
+    const DB::DataTypes & in_types,
+    DB::Hyperrectangle & out_hyperrectangle,
+    DB::DataTypes & out_types)
+{
+    out_hyperrectangle.clear();
+    out_types.clear();
+
+    const size_t n = in_hyperrectangle.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        const auto & range = in_hyperrectangle[i];
+        const auto & type = in_types[i];
+        flattenRangeAndType(range, type, out_hyperrectangle, out_types);
+    }
+}
+
+
 BoolMask KeyCondition::checkInHyperrectangle(
-    const Hyperrectangle & hyperrectangle,
-    const DataTypes & data_types,
+    const Hyperrectangle & hyperrectangle_,
+    const DataTypes & data_types_,
     const ColumnIndexToBloomFilter & column_index_to_column_bf) const
 {
+    Hyperrectangle hyperrectangle;
+    DataTypes data_types;
+    flattenHyperrectangleAndTypes(hyperrectangle_, data_types_, hyperrectangle, data_types);
+    
     std::vector<BoolMask> rpn_stack;
 
     auto curve_type = [&](size_t key_column_pos)
