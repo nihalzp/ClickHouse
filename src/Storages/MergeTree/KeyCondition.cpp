@@ -857,6 +857,58 @@ ActionsDAGWithInversionPushDown::ActionsDAGWithInversionPushDown(const ActionsDA
     predicate = dag->getOutputs()[0];
 }
 
+static size_t flattenTupleKeyColumnFromKeyExpr(
+    const Names & key_column_names, const ExpressionActionsPtr & key_expr, KeyCondition::ColumnIndices & key_columns_indices)
+{
+    Names result;
+
+    if (!key_expr)
+        return key_column_names.size();
+
+    const auto & actions_dag = key_expr->getActionsDAG();
+
+    /// Build name -> node map from the DAG for fast access
+    std::unordered_map<String, const ActionsDAG::Node *> node_by_name;
+    node_by_name.reserve(actions_dag.getNodes().size());
+    for (const auto & node : actions_dag.getNodes())
+        node_by_name.emplace(node.result_name, &node);
+
+    std::function<void(const ActionsDAG::Node *)> collect_flattened_names;
+    collect_flattened_names = [&](const ActionsDAG::Node * node)
+    {
+        if (!node)
+            return;
+
+        if (node->type == ActionsDAG::ActionType::FUNCTION && node->function_base->getName() == "tuple")
+        {
+            /// Flatten nested tuples: tuple(a, tuple(b, tuple(c, d))) -> a, b, c, d
+            for (const auto * child : node->children)
+                collect_flattened_names(child);
+        }
+        else
+        {
+            if (!key_columns_indices.contains(node->result_name))
+                key_columns_indices[node->result_name] = result.size();
+
+            /// Non-tuple node: keep as a single key component
+            /// Examples: "lower(name)", "id", "toInt64(other)", or arrays (not supported yet): ["id", "name"]
+            result.push_back(node->result_name);
+        }
+    };
+
+    /// For each key column name, find its DAG node and flatten it if it is a tuple()
+    for (const auto & key_name : key_column_names)
+    {
+        auto it = node_by_name.find(key_name);
+        chassert(it != node_by_name.end());
+
+        const auto * node = it->second;
+
+        collect_flattened_names(node);
+    }
+
+    return result.size();
+}
 
 KeyCondition::KeyCondition(
     const ActionsDAGWithInversionPushDown & filter_dag,
