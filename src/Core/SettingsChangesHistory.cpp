@@ -1037,6 +1037,7 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
             {"merge_max_dynamic_subcolumns_in_compact_part", "auto", "auto", "Add a new setting to limit number of dynamic subcolumns in Compact part after merge regardless the parameters specified in the data type"},
             {"materialize_statistics_on_merge", true, true, "New setting"},
             {"escape_index_filenames", false, true, "Escape non-ascii characters in filenames created for indices"},
+            {"flatten_and_deduplicate_primary_key_expressions", false, true, "New setting to flatten nested tuples and remove duplicate expressions in MergeTree keys during CREATE"},
         });
         addSettingsChanges(merge_tree_settings_changes_history, "25.12",
         {

@@ -1632,6 +1632,15 @@ namespace ErrorCodes
     DECLARE(Bool, allow_nullable_key, false, R"(
     Allow Nullable types as primary keys.
     )", 0) \
+    DECLARE(Bool, flatten_and_deduplicate_primary_key_expressions, true, R"(
+    Flatten nested tuples and remove duplicate expressions in MergeTree `ORDER BY` (sorting key) and explicit `PRIMARY KEY` during `CREATE TABLE`.
+
+    The key is treated as a list of expressions. Nested tuples are flattened and duplicates are removed (keeping the first occurrence).
+    This rewrite is applied only during CREATE, not during ATTACH or ALTER.
+
+    Example:
+    ORDER BY (a, (c, (b, a), (a, b))) -> ORDER BY (a, c, b)
+    )", 0) \
     DECLARE(Bool, allow_part_offset_column_in_projections, true, R"(
     Allow usage of '_part_offset' column in projections select query.
     )", 0) \
@@ -2651,6 +2660,7 @@ bool MergeTreeSettings::isReadonlySetting(const String & name)
         || name == "enable_mixed_granularity_parts"
         || name == "add_minmax_index_for_numeric_columns"
         || name == "add_minmax_index_for_string_columns"
+        || name == "flatten_and_deduplicate_primary_key_expressions"
         || name == "table_disk"
     ;
 }
