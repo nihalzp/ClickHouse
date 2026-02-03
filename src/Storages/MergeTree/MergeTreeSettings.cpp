@@ -1636,7 +1636,7 @@ namespace ErrorCodes
     Flatten nested tuples and remove duplicate expressions in MergeTree `ORDER BY` (sorting key) and explicit `PRIMARY KEY` during `CREATE TABLE`.
 
     The key is treated as a list of expressions. Nested tuples are flattened and duplicates are removed (keeping the first occurrence).
-    This rewrite is applied only during CREATE, not during ATTACH or ALTER.
+    This rewrite is applied only during user `CREATE TABLE`, not during `ATTACH` or `RESTORE`.
 
     Example:
     ORDER BY (a, (c, (b, a), (a, b))) -> ORDER BY (a, c, b)

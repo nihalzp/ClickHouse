@@ -2,6 +2,7 @@
 #include <Storages/MergeTree/MergeTreeIndexMinMax.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/FlattenNestedTuplesInKey.h>
 #include <Storages/MergeTree/extractZooKeeperPathFromReplicatedTableDef.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMergeTree.h>
@@ -57,6 +58,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool add_minmax_index_for_string_columns;
     extern const MergeTreeSettingsString auto_statistics_types;
     extern const MergeTreeSettingsBool escape_index_filenames;
+    extern const MergeTreeSettingsBool flatten_and_deduplicate_primary_key_expressions;
 }
 
 namespace ServerSetting
@@ -668,6 +670,25 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             }
         }
 
+        storage_settings->loadFromQuery(*args.storage_def, context, LoadingStrictnessLevel::ATTACH <= args.mode);
+
+        /// We want the normalization to be applied for user CREATE and for DatabaseReplicated replay (SECONDARY_CREATE),
+        /// but never during RESTORE from backup because RESTORE should keep the stored table definition intact.
+        if (args.mode <= LoadingStrictnessLevel::SECONDARY_CREATE && !args.is_restore_from_backup
+            && (*storage_settings)[MergeTreeSetting::flatten_and_deduplicate_primary_key_expressions])
+        {
+            auto sorting_key_ast = args.storage_def->order_by->ptr();
+            auto new_sorting_key_ast = MergeTreeKeyUtils::flattenAndDeduplicateSortingKeyAST(sorting_key_ast);
+            args.storage_def->replace(args.storage_def->order_by, new_sorting_key_ast);
+
+            if (args.storage_def->primary_key)
+            {
+                auto primary_key_ast = args.storage_def->primary_key->ptr();
+                auto new_primary_key_ast = MergeTreeKeyUtils::flattenAndDeduplicateKeyAST(primary_key_ast);
+                args.storage_def->replace(args.storage_def->primary_key, new_primary_key_ast);
+            }
+        }
+
         /// Get sorting key from engine arguments.
         ///
         /// NOTE: store merging_param_key_arg as additional key column. We do it
@@ -709,8 +730,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(
                 args.storage_def->getChild(*args.storage_def->ttl_table), metadata.columns, context, metadata.primary_key, allow_suspicious_ttl);
         }
-
-        storage_settings->loadFromQuery(*args.storage_def, context, LoadingStrictnessLevel::ATTACH <= args.mode);
 
         /// Updates the default storage_settings with settings specified via SETTINGS arg in a query
         if (args.storage_def->settings)
