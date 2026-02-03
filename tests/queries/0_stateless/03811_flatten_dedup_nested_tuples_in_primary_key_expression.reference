@@ -1,0 +1,34 @@
+PRIMARY KEY (a, (c, (b, a), (a, b)))
+CREATE TABLE default.test_explicit_pk_nested_tuple\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nPRIMARY KEY (a, c, b)\nORDER BY (a, c, b)\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+PRIMARY KEY (a, (c, (b, a), (a, b)))
+CREATE TABLE default.test_explicit_pk_tuple_col\n(\n    `a` Tuple(\n        UInt64,\n        UInt32),\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nPRIMARY KEY (a, c, b)\nORDER BY (a, c, b)\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+PRIMARY KEY (a, (b, a), (a, b))
+ORDER BY (a, (b, a), (a, b), c)
+CREATE TABLE default.test_pk_and_order_by_dedup\n(\n    `a` Tuple(\n        UInt64,\n        UInt32),\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nPRIMARY KEY (a, b)\nORDER BY (a, b, c)\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY tuple(a, tuple(c, b, a), a)
+CREATE TABLE default.test_order_by_tuple_func\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY tuple(a, c, b)\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY (sipHash64((a, b)), (a, (c, (b, a))))
+CREATE TABLE default.test_order_by_func_and_nested\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY (sipHash64((a, b)), a, c, b)\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY (a DESC, (b, a), c DESC)
+CREATE TABLE default.test_order_by_mixed_directions\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY tuple(a DESC, b, c DESC)\nSETTINGS allow_experimental_reverse_key = 1, flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY (a, (b, c) DESC)
+CREATE TABLE default.test_order_by_nested_direction\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY tuple(a, b DESC, c DESC)\nSETTINGS allow_experimental_reverse_key = 1, flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY (a, (b, (c, d)) DESC)
+CREATE TABLE default.test_order_by_deep_nested_direction\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32,\n    `d` UInt32\n)\nENGINE = MergeTree\nORDER BY tuple(a, b DESC, c DESC, d DESC)\nSETTINGS allow_experimental_reverse_key = 1, flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY (a, (b, a), c) DESC
+CREATE TABLE default.test_order_by_outer_desc\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY tuple(a DESC, b DESC, c DESC)\nSETTINGS allow_experimental_reverse_key = 1, flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY (a, (c, (b, a), (a, b)))
+CREATE TABLE default.test_show_keys_system_tables\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY (a, c, b)\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+a, c, b	a, c, b
+ORDER BY (a, (c, (b, a), (a, b)))
+CREATE TABLE default.test_attach_no_rewrite\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY (a, c, b)\nSETTINGS index_granularity = 8192
+ORDER BY (a, (c, (b, a), (a, b)))
+CREATE TABLE default.test_attach_no_rewrite\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY (a, c, b)\nSETTINGS index_granularity = 8192
+ORDER BY (a, (c, (b, a), (a, b)))
+CREATE TABLE default.test_attach_no_rewrite\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nORDER BY (a, c, b)\nSETTINGS index_granularity = 8192
+PRIMARY KEY (a, b, a, b, c)
+CREATE TABLE default.test_pk_dedup_only\n(\n    `a` UInt32,\n    `b` UInt32,\n    `c` UInt32\n)\nENGINE = MergeTree\nPRIMARY KEY (a, b, c)\nORDER BY (a, b, c)\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+PRIMARY KEY (a, (a, a))
+CREATE TABLE default.test_single_expr_pk\n(\n    `a` UInt32\n)\nENGINE = MergeTree\nPRIMARY KEY a\nORDER BY a\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
+ORDER BY (a, (d, (d, d)))
+CREATE TABLE default.test_alter_no_rewrite\n(\n    `a` UInt32,\n    `d` UInt32\n)\nENGINE = MergeTree\nPRIMARY KEY a\nORDER BY (a, (d, (d, d)))\nSETTINGS flatten_and_deduplicate_primary_key_expressions = 1, index_granularity = 8192
