@@ -8,20 +8,13 @@
 
 namespace ProfileEvents
 {
-    extern const Event AdaptiveAggregationStagedRecordsMerged;
-    extern const Event AdaptiveAggregationSealedChunks;
     extern const Event AdaptiveAggregationBucketsRetired;
     extern const Event AdaptiveAggregationStagedChunkSplits;
+    extern const Event AdaptiveAggregationThaws;
 }
 
 namespace DB
 {
-
-StagedChunk::AggregatePayload::AggregatePayload() = default;
-StagedChunk::AggregatePayload::AggregatePayload(AggregatePayload &&) noexcept = default;
-StagedChunk::AggregatePayload & StagedChunk::AggregatePayload::operator=(AggregatePayload &&) noexcept
-    = default;
-StagedChunk::AggregatePayload::~AggregatePayload() = default;
 
 void Aggregator::prepareStagedChunk(StagedChunk & block) const
 {
@@ -155,213 +148,118 @@ void Aggregator::retireAdaptiveMergedBucket(AggregatedDataVariants & dest, Adapt
     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationBucketsRetired);
 }
 
-namespace
+/// Thawing is the adaptive aggregation standing down globally: when the staged stream
+/// proves to keep repeating the same missing keys instead of bringing rare ones, every
+/// thread returns to ordinary insertion for good. A frozen table thaws; a thread still
+/// learning stops trying to freeze. Staging such a stream re-copies a repeated key's
+/// bytes on every occurrence, while an unfrozen table would absorb the repeats as cheap
+/// in-place updates.
+///
+/// The verdict is evaluated over totals shared by all threads; the tuning constants
+/// hold the calibration:
+///
+///     wasted bytes per distinct key = (repeat - 1) * bytes per record
+///                                   > adaptive_thaw_wasted_bytes_per_key
+///
+/// Here repeat = thaw_sampled_records / distinct_sampled_hashes, and bytes per record =
+/// staged_bytes / staged_records. A key's first record is the price of storing it once;
+/// each repeat wastes one record's bytes, so heavy records tolerate few repeats and tiny
+/// ones many. Until the verdict fires, every publish folds its batch into the shared
+/// evidence and re-evaluates, so the thread whose batch tips the totals over the bound
+/// fires for everyone by setting `thaw_all`, once `staged_records` has reached the
+/// `adaptive_thaw_min_staged_records` evidence floor. A publish updates:
+///
+/// - `staged_records` grows by the batch's record count.
+/// - `staged_bytes` grows by the batch's estimated footprint, computed below as
+///   `batch_bytes`. It counts the key bytes as the kernel staged them, the variable-width
+///   aggregate arguments at their gathered sizes (the sealed chunk's columns hold exactly
+///   the staged rows, so a wide tail behind a narrow frequent head is charged its real
+///   width rather than the block's average), and the per-record bookkeeping the chunk
+///   stores (the eight-byte routing hash, plus an eight-byte key offset only for
+///   byte-staged keys; fixed keys have no offsets). A column read by several aggregates is staged
+///   once, so it is counted once; a count batch stages a four-byte run length instead of
+///   arguments.
+///   The estimate is taken before the count deduplication (which merges a batch's
+///   repeats of one key into a single record with a run length), so it charges every
+///   staged record. That is deliberate: `staged_records` also counts the records before
+///   deduplication, and the verdict's bytes per record is `staged_bytes` divided by
+///   `staged_records`, so the two counters must describe the same set of records for
+///   the ratio to mean anything.
+///   Variable-width arguments count in full because staging such a value pays real work
+///   at every step. The seal gathers it out of the block into the staged column (a copy),
+///   the staged chunk pins that memory until the merge drains it, and updating the
+///   aggregate state from it copies the value once more (a string min keeps its own copy
+///   of the winning value). A repeated key pays all of that on every occurrence, where
+///   an unfrozen table would have paid a single in-place state update, so each repeat of
+///   a heavy value is genuine waste.
+///   Fixed-width arguments are deliberately not counted because their staging copy is a
+///   few bytes and the drain consumes the staged batch with the same vectorized batch
+///   executor the scan would have used on the original block. Deferring such values
+///   moves the work without multiplying it, so their staging costs about what their
+///   consumption saves. Charging them would fire the thaw on streams where staging is in
+///   fact profitable. The measured anchor is a stream of five UInt64 arguments at repeat
+///   10: it stays a clear adaptive win, and counting its forty fixed bytes per record
+///   would have thawed it.
+/// - The sampler receives the batch's routing hashes matching `hash & 0xFF == 0`, about
+///   total / 256 of them, collected outside the lock. `thaw_sampled_records` counts
+///   every sampled occurrence; `distinct_sampled_hashes` collapses a key's repeats onto
+///   one entry across all threads, so their ratio estimates the stream's repeat factor
+///   independently of how the keys spread over the threads.
+///
+/// The verdict lands at each thread's next between-blocks check; a learning thread about
+/// to freeze also checks it at the crossing, so no table freezes against it. The current
+/// records are still published: their rows were deferred by the frozen kernel and only
+/// the drain will aggregate them.
+void Aggregator::observeAdaptiveStagedRecords(
+    AdaptiveAggregationSession & shared, const PaddedPODArray<UInt64> & hashes, size_t batch_bytes) const
 {
-
-/// Concatenates the minis' bucket-grouped keys into `keys`: bucket b's records are the
-/// concatenation of the minis' b-slices in buffer order. A caller's payload concatenation must
-/// walk the same (bucket, mini) order, so a record keeps one position across the key, hash,
-/// and payload arrays.
-void concatenateStagedKeys(StagedChunk::StagedKeys & keys, const std::vector<MutableStagedChunkPtr> & minis)
-{
-    constexpr size_t num_buckets = ADAPTIVE_AGGREGATION_NUM_BUCKETS;
-
-    size_t total = 0;
-    for (size_t b = 0; b < num_buckets; ++b)
+    if (!shared.thaw_all.load(std::memory_order_relaxed))
     {
-        keys.bucket_offsets[b] = static_cast<UInt32>(total);
-        for (const auto & mini : minis)
+        PaddedPODArray<UInt64> sampled_hashes;
+        for (const auto hash : hashes)
+            if ((hash & adaptive_thaw_sample_mask) == 0)
+                sampled_hashes.push_back(hash);
+
+        std::lock_guard lock(shared.thaw_sample_mutex);
+        shared.staged_records += hashes.size();
+        shared.staged_bytes += batch_bytes;
+        shared.thaw_sampled_records += sampled_hashes.size();
+        for (const auto hash : sampled_hashes)
+            shared.distinct_sampled_hashes.insert(hash);
+        /// Re-checked under the lock: a thread that sampled while another was firing would
+        /// otherwise fire a second time. The verdict compares the wasted staged bytes per
+        /// distinct key, (repeat - 1) * bytes per record, against the bound. It is rearranged
+        /// onto a common denominator so the arithmetic stays integral:
+        /// (sampled - distinct) * staged_bytes > bound * distinct * staged_records.
+        /// The products are widened to 128 bits: a giant near-unique stream (billions of
+        /// staged records times their bytes) overflows 64, and a wrapped product could thaw
+        /// a healthy stream.
+        const size_t distinct = shared.distinct_sampled_hashes.size();
+        if (!shared.thaw_all.load(std::memory_order_relaxed)
+            && shared.staged_records >= adaptive_thaw_min_staged_records
+            && shared.thaw_sampled_records > distinct
+            && static_cast<UInt128>(shared.thaw_sampled_records - distinct) * shared.staged_bytes
+                > static_cast<UInt128>(adaptive_thaw_wasted_bytes_per_key) * distinct * shared.staged_records)
         {
-            chassert(mini->countsOnly() == minis.front()->countsOnly());
-            total += mini->keys.recordsForBucket(b);
+            shared.thaw_all.store(true, std::memory_order_relaxed);
+            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationThaws);
+            const double repeat = static_cast<double>(shared.thaw_sampled_records) / static_cast<double>(distinct);
+            LOG_TRACE(
+                log,
+                "Adaptive aggregation: thawing the local tables after {} staged records ({} bytes, repeat factor {:.2f}, {} wasted bytes per key)",
+                shared.staged_records,
+                shared.staged_bytes,
+                repeat,
+                static_cast<size_t>((repeat - 1.0) * (static_cast<double>(shared.staged_bytes) / static_cast<double>(shared.staged_records))));
         }
     }
-    keys.bucket_offsets[num_buckets] = static_cast<UInt32>(total);
 
-    UInt64 total_key_bytes = 0;
-    for (const auto & mini : minis)
-        total_key_bytes += mini->keys.key_bytes.size();
-
-    keys.routing_hashes.resize(total);
-    {
-        size_t pos = 0;
-        for (size_t b = 0; b < num_buckets; ++b)
-            for (const auto & mini : minis)
-            {
-                const size_t begin = mini->keys.bucket_offsets[b];
-                const size_t length = mini->keys.recordsForBucket(b);
-                if (!length)
-                    continue;
-                memcpy(&keys.routing_hashes[pos], &mini->keys.routing_hashes[begin], length * sizeof(UInt64));
-                pos += length;
-            }
-    }
-
-    keys.fixed_key_size = minis.front()->keys.fixed_key_size;
-    if (!keys.fixed_key_size)
-        keys.key_offsets.resize(total + 1);
-    keys.key_bytes.resize(total_key_bytes);
-    {
-        size_t pos = 0;
-        UInt64 byte_pos = 0;
-        for (size_t b = 0; b < num_buckets; ++b)
-            for (const auto & mini : minis)
-            {
-                const size_t begin = mini->keys.bucket_offsets[b];
-                const size_t length = mini->keys.recordsForBucket(b);
-                if (!length)
-                    continue;
-                const UInt64 src_begin = mini->keys.keyByteOffsetAt(begin);
-                const UInt64 slice_bytes = mini->keys.keyByteOffsetAt(begin + length) - src_begin;
-                memcpy(keys.key_bytes.data() + byte_pos, mini->keys.key_bytes.data() + src_begin, slice_bytes);
-                if (!keys.fixed_key_size)
-                    for (size_t j = 0; j < length; ++j)
-                        keys.key_offsets[pos + j] = byte_pos + (mini->keys.key_offsets[begin + j] - src_begin);
-                pos += length;
-                byte_pos += slice_bytes;
-            }
-        if (!keys.fixed_key_size)
-            keys.key_offsets[total] = byte_pos;
-    }
-}
-
-/// The bypassed count seal: a straight concatenation with no cross-mini dedup. Duplicate count
-/// records are legal - the drain merges them at its emplace - so a stale bypass costs staged
-/// memory until the next resample, never results.
-void sealValueStagedChunkConcatenated(const std::vector<MutableStagedChunkPtr> & minis, StagedChunk & chunk)
-{
-    concatenateStagedKeys(chunk.keys, minis);
-
-    auto & multiplicities = chunk.payload.emplace<StagedChunk::CountPayload>().multiplicities;
-    multiplicities.resize(chunk.keys.size());
-    size_t pos = 0;
-    for (size_t b = 0; b < ADAPTIVE_AGGREGATION_NUM_BUCKETS; ++b)
-        for (const auto & mini : minis)
-        {
-            const auto & mini_multiplicities = std::get<StagedChunk::CountPayload>(mini->payload).multiplicities;
-            const size_t begin = mini->keys.bucket_offsets[b];
-            const size_t length = mini->keys.recordsForBucket(b);
-            if (!length)
-                continue;
-            memcpy(&multiplicities[pos], &mini_multiplicities[begin], length * sizeof(UInt32));
-            pos += length;
-        }
-}
-
-}
-
-void Aggregator::stageChunk(
-    AdaptiveAggregationProducer & adaptive, MutableStagedChunkPtr block, size_t estimated_payload_bytes) const
-{
-    /// Coalescing pays in proportion to how many batches merge into one chunk. A batch of at
-    /// least half the seal target could only ever merge with one neighbor, gaining almost
-    /// nothing for a full extra copy of its data, so it is enqueued as-is.
-    if (estimated_payload_bytes * 2 >= adaptive_seal_target_bytes)
-    {
-        publishStagedChunk(*adaptive.session, std::move(block));
-        return;
-    }
-
-    adaptive.pending_chunks.push_back(std::move(block));
-    adaptive.pending_staged_bytes += estimated_payload_bytes;
-
-    if (adaptive.pending_staged_bytes >= adaptive_seal_target_bytes)
-        sealPendingChunks(adaptive);
 }
 
 void Aggregator::flushPendingChunks(AdaptiveAggregationProducer & adaptive) const
 {
-    if (!adaptive.pending_chunks.empty())
-        sealPendingChunks(adaptive);
-}
-
-void Aggregator::sealPendingChunks(AdaptiveAggregationProducer & adaptive) const
-{
-    constexpr size_t num_buckets = ADAPTIVE_AGGREGATION_NUM_BUCKETS;
-
-    auto & minis = adaptive.pending_chunks;
-    const size_t num_minis = minis.size();
-
-    if (num_minis == 1)
-    {
-        publishStagedChunk(*adaptive.session, minis.front());
-        minis.clear();
-        adaptive.pending_staged_bytes = 0;
-        return;
-    }
-
-    auto chunk = std::make_shared<StagedChunk>();
-    auto & keys = chunk->keys;
-    const bool counts_only = minis.front()->countsOnly();
-
-    if (counts_only)
-    {
-        /// The cross-mini dedup merges keys repeating across the buffered batches, which the
-        /// per-block publish dedup cannot see. On a distinct stream it merges nothing; the
-        /// productivity tracker then degrades the seal to a straight concatenation.
-        if (adaptive.seal_dedup.shouldDedup())
-        {
-            size_t input_records = 0;
-            for (const auto & mini : minis)
-                input_records += mini->keys.size();
-            sealValueStagedChunkDeduplicated(minis, *chunk);
-            adaptive.seal_dedup.record(input_records, chunk->keys.size());
-        }
-        else
-            sealValueStagedChunkConcatenated(minis, *chunk);
-    }
-    else
-    {
-        concatenateStagedKeys(keys, minis);
-
-        auto columns_of = [](const StagedChunk & mini) -> const Columns &
-        { return std::get<StagedChunk::AggregatePayload>(mini.payload).argument_columns; };
-
-        auto & argument_columns = chunk->payload.emplace<StagedChunk::AggregatePayload>().argument_columns;
-        argument_columns.assign(columns_of(*minis.front()).size(), nullptr);
-        for (const auto & argument_positions : aggregates_positions)
-            for (const auto position : argument_positions)
-            {
-                if (argument_columns[position])
-                    continue;
-
-                /// The seal normalized every batch's payload columns to the dense form the
-                /// drain consumes, so the buffered batches always agree at a position and the
-                /// coalescing is a plain concatenation.
-                VectorWithMemoryTracking<ColumnPtr> sources;
-                sources.reserve(num_minis);
-                for (const auto & mini : minis)
-                    sources.push_back(columns_of(*mini)[position]);
-
-                auto destination = sources.front()->cloneEmpty();
-                destination->prepareForSquashing(sources, /* factor */ 1);
-                for (size_t b = 0; b < num_buckets; ++b)
-                    for (size_t m = 0; m < num_minis; ++m)
-                    {
-                        const size_t begin = minis[m]->keys.bucket_offsets[b];
-                        const size_t length = minis[m]->keys.recordsForBucket(b);
-                        if (length)
-                            destination->insertRangeFrom(*sources[m], begin, length);
-                    }
-                argument_columns[position] = std::move(destination);
-            }
-    }
-
-    size_t batch_records = 0;
-    for (const auto & mini : minis)
-        batch_records += mini->keys.size();
-    ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSealedChunks);
-    ProfileEvents::increment(ProfileEvents::AdaptiveAggregationStagedRecordsMerged, batch_records - keys.size());
-
-    LOG_TRACE(
-        log,
-        "Adaptive aggregation: sealed {} staged batches into one chunk of {} records",
-        num_minis,
-        keys.size());
-
-    publishStagedChunk(*adaptive.session, std::move(chunk));
-    minis.clear();
-    adaptive.pending_staged_bytes = 0;
+    if (auto chunk = adaptive.converter.flush(aggregates_positions))
+        publishStagedChunk(*adaptive.session, std::move(chunk));
 }
 
 /// The flushed variants' sizes are meaningless by the time the external path finishes, so a
