@@ -155,20 +155,20 @@ TEST(AdaptiveAggregationPipeline, CompletionWaitsForPulledPayload)
     connect(second.getOutputs().front(), *completion);
     connect(merge.getOutputs().front(), result);
 
-    EXPECT_EQ(merge.prepare(), IProcessor::Status::NeedData);
+    EXPECT_EQ(merge.prepare({&merge.getInputs().front(), &merge.getInputs().back()}, {}), IProcessor::Status::NeedData);
     EXPECT_EQ(second.prepare(), IProcessor::Status::NeedData);
     second_producer.push(envelope(header, makeStagedChunk()));
     second_producer.finish();
     EXPECT_EQ(second.prepare(), IProcessor::Status::Ready);
     first_producer.finish();
     EXPECT_EQ(first.prepare(), IProcessor::Status::Finished);
-    EXPECT_EQ(merge.prepare(), IProcessor::Status::NeedData);
+    EXPECT_EQ(merge.prepare({&merge.getInputs().front(), &merge.getInputs().back()}, {}), IProcessor::Status::NeedData);
     EXPECT_EQ(second.prepare(), IProcessor::Status::Ready);
 
     second.work();
     EXPECT_EQ(second.prepare(), IProcessor::Status::Finished);
     /// The coordinator can finish consumption even without downstream result demand.
-    EXPECT_EQ(merge.prepare(), IProcessor::Status::Ready);
+    EXPECT_EQ(merge.prepare({&merge.getInputs().front(), &merge.getInputs().back()}, {}), IProcessor::Status::Ready);
     EXPECT_EQ(many_data->adaptive_session->backlog.undrainedRecords(), 1);
 }
 
@@ -243,6 +243,35 @@ TEST(AdaptiveAggregationPipeline, CompletesAtSingleAndMultipleExecutorThreads)
         EXPECT_EQ(sink->rows, expected_rows);
         EXPECT_EQ(sink->sum, expected_rows * (expected_rows - 1) / 2);
     }
+}
+
+TEST(AdaptiveAggregationPipeline, CompletionUsesUpdatedPortsAndCountsEachClosureOnce)
+{
+    auto header = makeHeader();
+    auto params = makeParams(header);
+    auto many_data = std::make_shared<ManyAggregatedData>(3);
+    many_data->adaptive_session = std::make_shared<AdaptiveAggregationSession>();
+    AdaptiveAggregationMergeTransform merge(params, many_data, 3, 3, nullptr);
+    OutputPort first(header);
+    OutputPort second(header);
+    OutputPort third(header);
+    InputPort result(header);
+    auto input = merge.getInputs().begin();
+    auto * first_input = &*input++;
+    auto * second_input = &*input++;
+    auto * third_input = &*input;
+    connect(first, *first_input);
+    connect(second, *second_input);
+    connect(third, *third_input);
+    connect(merge.getOutputs().front(), result);
+
+    first.finish();
+    EXPECT_EQ(merge.prepare({}, {}), IProcessor::Status::NeedData);
+    second.finish();
+    EXPECT_EQ(merge.prepare({first_input, second_input, second_input}, {}), IProcessor::Status::NeedData);
+    EXPECT_EQ(merge.prepare({second_input}, {}), IProcessor::Status::NeedData);
+    third.finish();
+    EXPECT_EQ(merge.prepare({third_input}, {}), IProcessor::Status::Ready);
 }
 
 TEST(AdaptiveAggregationPipeline, CancellationReleasesProducerOutboxAndSuspendedInput)

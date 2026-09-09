@@ -1,5 +1,6 @@
 #pragma once
 
+#include <unordered_set>
 #include <Processors/Transforms/AggregatingTransform.h>
 
 namespace DB
@@ -15,7 +16,7 @@ public:
         size_t max_threads_, size_t temporary_data_merge_threads_, RuntimeDataflowStatisticsCacheUpdaterPtr updater_);
 
     String getName() const override { return "AdaptiveAggregationMergeTransform"; }
-    Status prepare() override;
+    Status prepare(const UpdatedInputPorts & updated_inputs, const UpdatedOutputPorts &) override;
     void work() override;
     PipelineUpdate updatePipeline() override;
     void onCancel() noexcept override;
@@ -29,6 +30,8 @@ private:
     RuntimeDataflowStatisticsCacheUpdaterPtr updater;
     Processors processors;
     std::list<TemporaryBlockStreamHolder> tmp_files;
+    std::unordered_set<const InputPort *> unfinished_inputs;
+    bool inputs_initialized = false;
     bool merge_initialized = false;
     bool pipeline_created = false;
 };

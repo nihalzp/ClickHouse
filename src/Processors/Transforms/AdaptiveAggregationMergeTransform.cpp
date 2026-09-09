@@ -21,7 +21,7 @@ AdaptiveAggregationMergeTransform::AdaptiveAggregationMergeTransform(
         inputs.emplace_back(*header, this);
 }
 
-IProcessor::Status AdaptiveAggregationMergeTransform::prepare()
+IProcessor::Status AdaptiveAggregationMergeTransform::prepare(const UpdatedInputPorts & updated_inputs, const UpdatedOutputPorts &)
 {
     auto & output = outputs.front();
     if (isCancelled() || output.isFinished())
@@ -35,16 +35,25 @@ IProcessor::Status AdaptiveAggregationMergeTransform::prepare()
 
     if (!merge_initialized)
     {
-        bool finished = true;
-        for (auto & input : inputs)
+        if (!inputs_initialized)
         {
-            if (!input.isFinished())
+            for (auto & input : inputs)
             {
-                input.setNeeded();
-                finished = false;
+                if (!input.isFinished())
+                {
+                    input.setNeeded();
+                    unfinished_inputs.insert(&input);
+                }
             }
+            inputs_initialized = true;
         }
-        return finished ? Status::Ready : Status::NeedData;
+        else
+        {
+            for (const auto * input : updated_inputs)
+                if (input->isFinished())
+                    unfinished_inputs.erase(input);
+        }
+        return unfinished_inputs.empty() ? Status::Ready : Status::NeedData;
     }
 
     if (!pipeline_created)
