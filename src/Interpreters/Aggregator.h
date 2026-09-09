@@ -272,14 +272,16 @@ public:
     const Params & getParams() const { return params; }
 
     /// Process one block. Return false if the processing should be aborted (with group_by_overflow_mode = 'break').
-    /// `adaptive` is the per-thread adaptive-aggregation context, or nullptr when the feature is off.
+    /// Adaptive producers supply both their conversion context and processor-owned execution storage.
+    /// A nonempty continuation suspends post-block checks until ready chunks have been admitted.
     bool executeOnBlock(Columns columns,
         size_t row_begin, size_t row_end,
         AggregatedDataVariants & result,
         ColumnRawPtrs & key_columns,
         AggregateColumns & aggregate_columns, /// Passed to not create them anew for each block
         bool & no_more_keys,
-        AdaptiveAggregationProducer * adaptive) const;
+        AdaptiveAggregationProducer * adaptive,
+        AdaptiveAggregationExecution * execution = nullptr) const;
 
     /// One claimed batch of staged chunks into one drain table, bucket-major: bucket b's
     /// slices from all of the batch's chunks drain consecutively, so the destination subtable
@@ -322,10 +324,18 @@ public:
         AdaptiveAggregationSession & shared,
         std::atomic<bool> & is_cancelled) const;
 
-    /// Seals and enqueues this thread's buffered staged blocks. Every producing transform calls
-    /// it when its input ends, before the finish barrier, so the backlogs are complete by the
-    /// time the last finisher assembles the merge.
-    void flushPendingChunks(AdaptiveAggregationProducer & adaptive) const;
+    /// Seals buffered candidates and appends prepared pieces to the producer's outbox. The
+    /// producer waits for admission before resuming pressure work or finishing its stream.
+    void flushPendingChunks(AdaptiveAggregationProducer & adaptive, std::vector<StagedChunkPtr> & ready_chunks) const;
+
+    /// Resumes the post-block checks after the producer's admission port acknowledges publication.
+    bool resumeAdaptiveBlock(
+        AdaptiveAggregationProducer & adaptive, AdaptiveAggregationExecution & execution,
+        AggregatedDataVariants & result, bool & no_more_keys) const;
+
+    /// Registers an immutable chunk in the allocation context of its producer's publication point.
+    void admitStagedChunk(
+        AdaptiveAggregationSession & shared, const StagedChunkPtr & chunk, bool use_own_memory_tracker) const;
 
     /// The production-time memory valve: claims batches of staged chunks bounded in records
     /// and in bytes under the sweep lock, drains each into a producer-local table outside the
@@ -537,6 +547,7 @@ private:
 
     friend struct AggregatedDataVariants;
     friend struct StagedChunkPreparation;
+    friend struct AdaptiveAggregationExecution;
     friend class ConvertingAggregatedToChunksTransform;
     friend class ConvertingAggregatedToChunksSource;
     friend class ConvertingAggregatedToChunksWithMergingSource;
@@ -755,6 +766,7 @@ private:
         ColumnRawPtrs & key_columns,
         AggregateFunctionInstruction * aggregate_instructions,
         AdaptiveAggregationProducer & adaptive,
+        std::vector<StagedChunkPtr> & ready_chunks,
         bool all_keys_are_const) const;
 
     template <typename LocalMethod, typename SharedMethod>
@@ -769,6 +781,7 @@ private:
         ColumnRawPtrs & key_columns,
         AggregateFunctionInstruction * aggregate_instructions,
         AdaptiveAggregationProducer & adaptive,
+        std::vector<StagedChunkPtr> & ready_chunks,
         bool all_keys_are_const) const;
 
     /// The set counterpart: with no aggregate functions there are no places to record and no states to
@@ -785,6 +798,7 @@ private:
         ColumnRawPtrs & key_columns,
         AggregateFunctionInstruction * aggregate_instructions,
         AdaptiveAggregationProducer & adaptive,
+        std::vector<StagedChunkPtr> & ready_chunks,
         bool all_keys_are_const) const;
 
     /// Groups the current block's staged misses by bucket (counting sort) into one staged chunk
@@ -792,26 +806,37 @@ private:
     /// the hashing state's key holder into their bucket position; row-reference mode additionally
     /// gathers the records' aggregate-argument values into dense compacted columns.
     template <typename SharedKey, typename State>
-    void publishDelayedRecords(
+    void stageDelayedRecords(
         const Columns & columns,
         size_t num_rows,
         AdaptiveAggregationProducer & adaptive,
+        std::vector<StagedChunkPtr> & ready_chunks,
         State & local_find_state,
         Arena & scratch_pool,
         bool counts_only,
         std::optional<UInt32> key_row_override = std::nullopt) const;
 
+    bool finishOnBlock(
+        AggregatedDataVariants & result, bool & no_more_keys, size_t input_rows,
+        size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
+        AdaptiveAggregationProducer * adaptive, AdaptiveAggregationExecution * execution) const;
+
+    bool finishBaselineBlock(
+        AggregatedDataVariants & result, bool & no_more_keys,
+        size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
+        AdaptiveAggregationProducer * adaptive) const;
+
     /// Observes pre-deduplication records using the existing session-wide thaw sample.
     void observeAdaptiveStagedRecords(
         AdaptiveAggregationSession & shared, const PaddedPODArray<UInt64> & hashes, size_t batch_bytes) const;
 
-    /// The single publication point: checks the structural invariants in debug builds, cuts
-    /// the chunk at the part bound if it is over it, and enqueues the result.
-    void publishStagedChunk(AdaptiveAggregationSession & shared, MutableStagedChunkPtr block) const;
+    /// Checks candidate invariants, splits at the pressure part bound, and prepares immutable
+    /// pieces for transport. Shared backlog registration belongs to the admission transform.
+    void prepareStagedChunks(
+        const AdaptiveAggregationSession & shared, MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const;
 
-    /// Finishes one chunk (builds its preparation in place) and hands it over as immutable to
-    /// the session's backlog.
-    void enqueueStagedChunk(AdaptiveAggregationSession & shared, MutableStagedChunkPtr block) const;
+    /// Prepares one final payload in place and appends it as immutable to the producer's outbox.
+    void appendPreparedStagedChunk(MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const;
 
     /// Cuts a chunk whose drain is estimated over `adaptivePressurePartBytes` into pieces
     /// along bucket boundaries, each estimated within the bound where a single bucket allows;

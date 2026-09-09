@@ -35,9 +35,15 @@ namespace DB
 /// statistics, so later runs of the query skip the engagement altogether instead of
 /// re-measuring the stream.
 ///
-/// Merge phase: at the end of input every local table converts to two-level and the standard
-/// bucket-parallel merge runs, except that the merge task owning bucket b first drains backlog b
-/// into the destination's bucket b (it is the exclusive owner, so no locks are needed) and only
+/// Transport: each producer synchronously builds owned staged chunks and sends them through a
+/// dedicated admission transform. Admission registers the prepared payload in the shared backlog;
+/// renewed input demand acknowledges that registration. Producers wait for acknowledgement before
+/// their memory checks, pressure drains, and final completion. Admission outputs carry completion
+/// only, so registration remains parallel across producers without waking a central receiver per chunk.
+///
+/// Merge phase: at the end of input every local table converts to two-level. The standard
+/// bucket-parallel merge runs after every admission stream finishes. The task owning bucket b
+/// first drains backlog b into that bucket (it is the exclusive owner, so no locks are needed),
 /// then folds the locals' bucket b in as usual.
 ///
 /// The net effect: frequent keys stay in small cache-resident tables, and a rare key is stored
@@ -48,6 +54,9 @@ using AdaptiveAggregationSessionPtr = std::shared_ptr<AdaptiveAggregationSession
 /// Per-transform context of the adaptive aggregation: the thread's lifecycle phase, per-block
 /// staging for the missed rows, and the buffered chunks awaiting coalescing.
 struct AdaptiveAggregationProducer;
+
+/// Producer-owned transport and suspended post-block work.
+struct AdaptiveAggregationExecution;
 
 /// All delayed records of one consumed block, grouped by bucket. A published chunk is
 /// immutable; only the producer building a chunk holds it mutably.

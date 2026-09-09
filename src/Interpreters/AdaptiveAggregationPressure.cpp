@@ -1,25 +1,14 @@
 #include <algorithm>
-#include <bit>
 #include <limits>
-
-#include <Columns/ColumnConst.h>
-#include <Columns/ColumnSparse.h>
-#include <Columns/ColumnsNumber.h>
+#include <Columns/IColumn.h>
 #include <Common/Arena.h>
 #include <Common/CurrentThread.h>
-#include <Common/HashTable/HashTableKeyHolder.h>
-#include <Common/ProfileEvents.h>
-#include <Common/assert_cast.h>
-#include <Common/logger_useful.h>
 #include <Common/MemoryTrackerUtils.h>
+#include <Common/ProfileEvents.h>
 #include <Common/ThreadStatus.h>
-#include <Common/memcpySmall.h>
-#include <DataTypes/DataTypeLowCardinality.h>
-#include <base/arithmeticOverflow.h>
-#include <base/memcmpSmall.h>
-#include <base/unaligned.h>
+#include <Common/logger_useful.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
-#include <Interpreters/AggregationUtils.h>
+#include <base/arithmeticOverflow.h>
 
 namespace ProfileEvents
 {
@@ -119,14 +108,6 @@ size_t Aggregator::estimateAdaptiveDrainBytes(AggregatedDataVariants::Type type,
     return estimated_bytes;
 }
 
-/// The memory a published chunk holds, and keeps holding until the drain that claimed it
-/// returns: the staged keys, and the staged payload beside them - the run lengths of a
-/// count-only chunk, or the argument columns a general-aggregate chunk gathered at publish,
-/// whose variable-width values can outweigh everything the drained table itself will cost.
-/// Variable-width keys are counted twice, because a pressure-time drain copies them into the
-/// table's arena while the chunk still holds the staged bytes, so both copies are resident when
-/// the drain returns; a fixed-size key lives in the table's cell, which the per-record charge
-/// of `Aggregator::adaptiveDrainRecordBytes` already covers.
 /// The bytes the calling thread holds as its own memory tracker counts them, with the untracked
 /// tail flushed so that two readings around a piece of work bound what it allocated and kept.
 /// Unlike a table's `allocatedBytes`, which sums its arenas and hash-table buffers, this sees
@@ -160,6 +141,14 @@ static AggregatedDataVariantsPtr detachSharedDrainTable(AdaptiveAggregationSessi
     return full;
 }
 
+/// The memory a published chunk holds, and keeps holding until the drain that claimed it
+/// returns: the staged keys, and the staged payload beside them - the run lengths of a
+/// count-only chunk, or the argument columns a general-aggregate chunk gathered at publish,
+/// whose variable-width values can outweigh everything the drained table itself will cost.
+/// Variable-width keys are counted twice, because a pressure-time drain copies them into the
+/// table's arena while the chunk still holds the staged bytes, so both copies are resident when
+/// the drain returns; a fixed-size key lives in the table's cell, which the per-record charge
+/// of `Aggregator::adaptiveDrainRecordBytes` already covers.
 static size_t estimateStagedBytesWithKeyCopy(const StagedChunk & chunk)
 {
     const size_t key_bytes = chunk.keys.key_bytes.allocated_bytes();

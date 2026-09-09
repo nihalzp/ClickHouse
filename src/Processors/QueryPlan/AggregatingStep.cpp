@@ -27,6 +27,8 @@
 #include <Processors/ResizeProcessor.h>
 #include <Processors/Transforms/AggregatingInOrderTransform.h>
 #include <Processors/Transforms/AggregatingTransform.h>
+#include <Processors/Transforms/AdaptiveAggregationAdmissionTransform.h>
+#include <Processors/Transforms/AdaptiveAggregationMergeTransform.h>
 #include <Processors/Transforms/CopyTransform.h>
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/MemoryBoundMerging.h>
@@ -699,9 +701,25 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                     dataflow_cache_updater);
             });
 
+        std::shared_ptr<AdaptiveAggregationMergeTransform> adaptive_merge;
+        if (use_adaptive_aggregator)
+        {
+            pipeline.addSimpleTransform(
+                [&](const SharedHeader & header)
+                {
+                    return std::make_shared<AdaptiveAggregationAdmissionTransform>(header, transform_params, many_data->adaptive_session);
+                });
+            adaptive_merge = std::make_shared<AdaptiveAggregationMergeTransform>(
+                transform_params, many_data, new_merge_threads, new_temporary_data_merge_threads, dataflow_cache_updater);
+            pipeline.addTransform(adaptive_merge);
+        }
+
         pipeline.resize(streams_after_aggregation, false, settings.min_outstreams_per_resize_after_split);
 
         aggregating = collector.detachProcessors(static_cast<size_t>(AggregatingStage::PartialAggregation));
+        if (adaptive_merge)
+            adaptive_merge->setQueryPlanStepGroup(static_cast<size_t>(AggregatingStage::FinalAggregation));
+
     }
     else
     {

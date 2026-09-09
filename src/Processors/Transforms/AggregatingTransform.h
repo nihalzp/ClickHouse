@@ -74,11 +74,8 @@ struct ManyAggregatedData
     ManyAggregatedDataVariants variants;
     std::atomic<UInt32> num_finished = 0;
 
-    /// The number of producers that have to reach the finish barrier in
-    /// `AggregatingTransform::initGenerate`, fixed at construction time.
-    /// `variants.size()` cannot be used instead: the last finisher appends the adaptive
-    /// aggregation's early-drain routing table to `variants`, and reading the size of a vector
-    /// that is concurrently grown is a data race.
+    /// Fixed producer slots, independent of the routing-table variant appended during final
+    /// assembly. Ordinary aggregation counts finishers; adaptive aggregation uses port completion.
     const size_t num_producers;
 
     /// Set when the adaptive aggregation is enabled for this aggregation (see
@@ -97,21 +94,13 @@ struct ManyAggregatedData
 using AggregatingTransformParamsPtr = std::shared_ptr<AggregatingTransformParams>;
 using ManyAggregatedDataPtr = std::shared_ptr<ManyAggregatedData>;
 
-/** Aggregates the stream of blocks using the specified key columns and aggregate functions.
-  * Columns with aggregate functions adds to the end of the block.
-  * If final = false, the aggregate functions are not finalized, that is, they are not replaced by their value, but contain an intermediate state of calculations.
-  * This is necessary so that aggregation can continue (for example, by combining streams of partially aggregated data).
-  *
-  * For every separate stream of data separate AggregatingTransform is created.
-  * Every AggregatingTransform reads data from the first port till is is not run out, or max_rows_to_group_by reached.
-  * When the last AggregatingTransform finish reading, the result of aggregation is needed to be merged together.
-  * This task is performed by ConvertingAggregatedToChunksTransform.
-  * Last AggregatingTransform expands pipeline and adds second input port, which reads from ConvertingAggregated.
-  *
-  * Aggregation data is passed by ManyAggregatedData structure, which is shared between all aggregating transforms.
-  * At aggregation step, every transform uses it's own AggregatedDataVariants structure.
-  * At merging step, all structures pass to ConvertingAggregatedToChunksTransform.
-  */
+/// Aggregates one input stream into its own variant in `ManyAggregatedData`. With `final = false`,
+/// result columns hold aggregate states for subsequent merging.
+///
+/// Ordinary aggregation uses the last producer to assemble the merge pipeline and forward its
+/// results through a second input. Adaptive producers instead emit owned staged payloads to a
+/// dedicated admission transform and close their output after admission and local finishing.
+/// `AdaptiveAggregationMergeTransform` owns final assembly after all admission streams finish.
 class AggregatingTransform final : public IProcessor
 {
 public:
@@ -167,6 +156,7 @@ private:
     /// on `many_data`. Held by pointer: the producer's definition stays out of this widely
     /// included header (see `AdaptiveAggregationImpl.h`).
     std::unique_ptr<AdaptiveAggregationProducer> adaptive_context;
+    std::unique_ptr<AdaptiveAggregationExecution> adaptive_execution;
 
     size_t max_threads = 1;
     size_t temporary_data_merge_threads = 1;
@@ -195,8 +185,19 @@ private:
 
     RuntimeDataflowStatisticsCacheUpdaterPtr updater;
 
+    Status prepareAdaptive();
+    void finishLocalAggregation();
+    void finishAdaptiveAggregation();
     void initGenerate();
 };
+
+/// Assembles the existing in-memory or external merge after all producers finish. The caller
+/// retains temporary-file holders for the lifetime of the returned reader pipeline.
+Processors createAggregationMergePipeline(
+    const AggregatingTransformParamsPtr & params, const ManyAggregatedDataPtr & many_data,
+    size_t max_threads, size_t temporary_data_merge_threads,
+    bool should_produce_results_in_order_of_bucket_number, bool skip_merging,
+    const RuntimeDataflowStatisticsCacheUpdaterPtr & updater, std::list<TemporaryBlockStreamHolder> & tmp_files);
 
 Chunk convertToChunk(const Block & block);
 

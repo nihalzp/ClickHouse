@@ -2,26 +2,9 @@
 /// templates are defined in AdaptiveAggregationStagingImpl.h; bucket application and pressure
 /// policy have separate translation units.
 
-#include <algorithm>
-#include <bit>
 #include <limits>
-
-#include <Columns/ColumnConst.h>
-#include <Columns/ColumnSparse.h>
-#include <Columns/ColumnsNumber.h>
-#include <Common/Arena.h>
-#include <Common/CurrentThread.h>
-#include <Common/HashTable/HashTableKeyHolder.h>
 #include <Common/ProfileEvents.h>
-#include <Common/assert_cast.h>
 #include <Common/logger_useful.h>
-#include <Common/MemoryTrackerUtils.h>
-#include <Common/ThreadStatus.h>
-#include <Common/memcpySmall.h>
-#include <DataTypes/DataTypeLowCardinality.h>
-#include <base/arithmeticOverflow.h>
-#include <base/memcmpSmall.h>
-#include <base/unaligned.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
 #include <Interpreters/AdaptiveAggregationStagingImpl.h>
 #include <Interpreters/AggregationUtils.h>
@@ -74,6 +57,7 @@ void Aggregator::executeFrozen(
     ColumnRawPtrs & key_columns,
     AggregateFunctionInstruction * aggregate_instructions,
     AdaptiveAggregationProducer & adaptive,
+    std::vector<StagedChunkPtr> & ready_chunks,
     bool all_keys_are_const) const
 {
 #define M(NAME) \
@@ -88,6 +72,7 @@ void Aggregator::executeFrozen(
             key_columns, \
             aggregate_instructions, \
             adaptive, \
+            ready_chunks, \
             all_keys_are_const);
 
     if (false) {} // NOLINT
@@ -112,6 +97,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     ColumnRawPtrs & key_columns,
     AggregateFunctionInstruction *,
     AdaptiveAggregationProducer & adaptive,
+    std::vector<StagedChunkPtr> & ready_chunks,
     bool all_keys_are_const) const
 {
     Arena scratch_pool;
@@ -143,8 +129,8 @@ void NO_INLINE Aggregator::executeFrozenImpl(
         if (!local_method.data.find(key, hash))
         {
             stage_miss(key, hash, row_begin);
-            publishDelayedRecords<typename SharedMethod::Key>(
-                columns, row_end, adaptive, local_find_state, scratch_pool, /*counts_only=*/false, /*key_row_override=*/0);
+            stageDelayedRecords<typename SharedMethod::Key>(
+                columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/false, /*key_row_override=*/0);
         }
         keyHolderDiscardKey(key_holder);
         return;
@@ -177,8 +163,8 @@ void NO_INLINE Aggregator::executeFrozenImpl(
         }
     }
 
-    publishDelayedRecords<typename SharedMethod::Key>(
-        columns, row_end, adaptive, local_find_state, scratch_pool, /*counts_only=*/false);
+    stageDelayedRecords<typename SharedMethod::Key>(
+        columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/false);
 }
 
 template <typename LocalMethod, typename SharedMethod>
@@ -193,6 +179,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     ColumnRawPtrs & key_columns,
     AggregateFunctionInstruction * aggregate_instructions,
     AdaptiveAggregationProducer & adaptive,
+    std::vector<StagedChunkPtr> & ready_chunks,
     bool all_keys_are_const) const
 {
     Arena scratch_pool;
@@ -277,8 +264,8 @@ void NO_INLINE Aggregator::executeFrozenImpl(
                         adaptive.converter.miss_key_sizes.push_back(adaptiveStagedKeyBytes(key).size());
                 }
             }
-            publishDelayedRecords<typename SharedMethod::Key>(
-                columns, row_end, adaptive, local_find_state, scratch_pool, /*counts_only=*/is_simple_count, /*key_row_override=*/0);
+            stageDelayedRecords<typename SharedMethod::Key>(
+                columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/is_simple_count, /*key_row_override=*/0);
         }
         keyHolderDiscardKey(key_holder);
         return;
@@ -346,7 +333,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
             keyHolderDiscardKey(key_holder);
         }
         update_bypass_sampling(hits, row_end - row_begin);
-        publishDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, local_find_state, scratch_pool, /*counts_only=*/true);
+        stageDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/true);
         return;
     }
 
@@ -391,7 +378,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     {
         const size_t hits = probe_rows.template operator()<false>(nullptr);
         update_bypass_sampling(hits, row_end - row_begin);
-        publishDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, local_find_state, scratch_pool, /*counts_only=*/false);
+        stageDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/false);
         return;
     }
 
@@ -406,7 +393,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 
     const size_t hits = probe_rows.template operator()<true>(places.get());
     update_bypass_sampling(hits, row_end - row_begin);
-    publishDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, local_find_state, scratch_pool, /*counts_only=*/false);
+    stageDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/false);
 
     /// With no local hits every place is null and the batch pass would only skip rows; the
     /// staged records carry the block's whole contribution. Bypassed blocks are always all-miss.
@@ -424,10 +411,11 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 }
 
 template <typename SharedKey, typename State>
-void NO_INLINE Aggregator::publishDelayedRecords(
+void NO_INLINE Aggregator::stageDelayedRecords(
     const Columns & columns,
     size_t num_rows,
     AdaptiveAggregationProducer & adaptive,
+    std::vector<StagedChunkPtr> & ready_chunks,
     State & local_find_state,
     Arena & scratch_pool,
     bool counts_only,
@@ -479,7 +467,7 @@ void NO_INLINE Aggregator::publishDelayedRecords(
                 estimated_payload_bytes += column->byteSize();
 
     if (auto ready = adaptive.converter.stage(std::move(block), estimated_payload_bytes, aggregates_positions))
-        publishStagedChunk(*adaptive.session, std::move(ready));
+        prepareStagedChunks(*adaptive.session, std::move(ready), ready_chunks);
 }
 
 }

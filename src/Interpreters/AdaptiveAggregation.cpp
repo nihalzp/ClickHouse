@@ -2,6 +2,7 @@
 
 #include <Columns/IColumn.h>
 #include <Common/Arena.h>
+#include <Common/MemoryTrackerSwitcher.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
@@ -54,8 +55,8 @@ void Aggregator::initAdaptiveSession(AggregatedDataVariants & local_result, Adap
     shared.initialized.store(true, std::memory_order_release);
 }
 
-void Aggregator::publishStagedChunk(
-    AdaptiveAggregationSession & shared, MutableStagedChunkPtr block) const
+void Aggregator::prepareStagedChunks(
+    const AdaptiveAggregationSession & shared, MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const
 {
     chassert(block->wellFormed());
 
@@ -64,7 +65,7 @@ void Aggregator::publishStagedChunk(
     auto pieces = splitStagedChunkAtPartBound(shared, *block);
     if (pieces.empty())
     {
-        enqueueStagedChunk(shared, std::move(block));
+        appendPreparedStagedChunk(std::move(block), ready_chunks);
         return;
     }
 
@@ -78,18 +79,27 @@ void Aggregator::publishStagedChunk(
     for (auto & piece : pieces)
     {
         chassert(piece->wellFormed());
-        enqueueStagedChunk(shared, std::move(piece));
+        appendPreparedStagedChunk(std::move(piece), ready_chunks);
     }
 }
 
-void Aggregator::enqueueStagedChunk(AdaptiveAggregationSession & shared, MutableStagedChunkPtr block) const
+void Aggregator::appendPreparedStagedChunk(MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const
 {
     /// Prepared here, on the publishing thread, so the chunk is immutable once any bucket can
     /// see it.
     if (std::holds_alternative<StagedChunk::AggregatePayload>(block->payload))
         prepareStagedChunk(*block);
 
-    shared.backlog.publish(std::move(block));
+    ready_chunks.push_back(std::move(block));
+}
+
+void Aggregator::admitStagedChunk(
+    AdaptiveAggregationSession & shared, const StagedChunkPtr & chunk, bool use_own_memory_tracker) const
+{
+    std::optional<MemoryTrackerSwitcher> memory_tracker_switcher;
+    if (use_own_memory_tracker)
+        memory_tracker_switcher.emplace(memory_tracker.get());
+    shared.backlog.publish(chunk);
 }
 
 void AdaptiveAggregationSession::StagedBacklog::publish(const StagedChunkPtr & chunk)
@@ -256,10 +266,10 @@ void Aggregator::observeAdaptiveStagedRecords(
 
 }
 
-void Aggregator::flushPendingChunks(AdaptiveAggregationProducer & adaptive) const
+void Aggregator::flushPendingChunks(AdaptiveAggregationProducer & adaptive, std::vector<StagedChunkPtr> & ready_chunks) const
 {
     if (auto chunk = adaptive.converter.flush(aggregates_positions))
-        publishStagedChunk(*adaptive.session, std::move(chunk));
+        prepareStagedChunks(*adaptive.session, std::move(chunk), ready_chunks);
 }
 
 /// The flushed variants' sizes are meaningless by the time the external path finishes, so a

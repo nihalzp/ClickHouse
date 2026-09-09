@@ -114,7 +114,7 @@ struct AdaptiveAggregationSession
         std::vector<StagedChunkPtr> takeAllForPressureDrain();
 
         /// The bucket's remaining chunks, read without the mutex: production is over by the
-        /// time the merge tasks run (the finish barrier ordered every producer's publish
+        /// time the merge tasks run (completion of every admission stream ordered registration
         /// before the merge sources were created), and the chunks deliberately stay put - the
         /// merge emplaces keys that point into their staged bytes, so they must live until the
         /// merged buckets are converted, and the session (owned by every merge source) is
@@ -337,7 +337,7 @@ struct AdaptiveAggregationProducer
             /// many times that many rows, so the stream is repeat-dominated locally.
             TooFewDistinctKeys,
             /// The global thaw: the session-wide staged-key sample proved the whole stream
-            /// repeat-dominated (see `publishDelayedRecords`).
+            /// repeat-dominated (see `stageDelayedRecords`).
             RepeatedStagedKeys,
         };
         Reason reason;

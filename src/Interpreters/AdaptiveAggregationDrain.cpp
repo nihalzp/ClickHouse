@@ -1,25 +1,10 @@
 #include <algorithm>
-#include <bit>
-#include <limits>
-
-#include <Columns/ColumnConst.h>
-#include <Columns/ColumnSparse.h>
-#include <Columns/ColumnsNumber.h>
 #include <Common/Arena.h>
-#include <Common/CurrentThread.h>
 #include <Common/HashTable/HashTableKeyHolder.h>
 #include <Common/ProfileEvents.h>
-#include <Common/assert_cast.h>
-#include <Common/logger_useful.h>
-#include <Common/MemoryTrackerUtils.h>
-#include <Common/ThreadStatus.h>
-#include <Common/memcpySmall.h>
-#include <DataTypes/DataTypeLowCardinality.h>
-#include <base/arithmeticOverflow.h>
-#include <base/memcmpSmall.h>
-#include <base/unaligned.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
 #include <Interpreters/AggregationUtils.h>
+#include <base/unaligned.h>
 
 namespace ProfileEvents
 {
@@ -57,18 +42,6 @@ namespace
                 DB::ErrorCodes::UNKNOWN_AGGREGATED_DATA_VARIANT, "Unknown aggregated data variant in the adaptive drain path.");
     }
 
-    /// Emplace one staged key into the table. String-like keys were staged as raw characters
-    /// and are rebuilt here. `key_storage` selects the ownership: at merge time the delayed
-    /// blocks are retained on the shared state until after the merged buckets are converted, so
-    /// string-like keys are emplaced pointing into the staged bytes directly, with no copy; a
-    /// pressure-time drain instead persists them into the arena, because freeing the blocks is
-    /// its purpose. Fixed-size keys were staged as values either way.
-    /// `table` is the bucket's own submap: the records were grouped by the same hash dispatch
-    /// at staging time, so emplacing into it directly skips the per-record two-level routing.
-    /// Prefetch the table slot of the record `prefetch_look_ahead` positions ahead of `j`, if
-    /// any: hash-organized tables prefetch by the saved routing hash, string tables locate the
-    /// slot from the key bytes and the hash. The two drain loops share this so the dispatch
-    /// cannot drift between them.
     /// Position and width of record j's staged key bytes. A fixed-size-key chunk carries no
     /// offsets array, and in the drains the width is the compile-time key width, so the
     /// position is a plain multiplication.
@@ -81,6 +54,10 @@ namespace
             return {keys.key_bytes.data() + j * sizeof(Key), sizeof(Key)};
     }
 
+    /// Prefetch the table slot of the record `prefetch_look_ahead` positions ahead of `j`, if
+    /// any: hash-organized tables prefetch by the saved routing hash, string tables locate the
+    /// slot from the key bytes and the hash. The two drain loops share this so the dispatch
+    /// cannot drift between them.
     template <typename Key, typename Impl>
     void ALWAYS_INLINE prefetchStagedKey(Impl & impl, const DB::StagedChunk::StagedKeys & keys, size_t j, size_t slice_end)
     {
@@ -93,6 +70,14 @@ namespace
             impl.prefetch(keys.keyBytesAt(la), keys.routing_hashes[la]);
     }
 
+    /// Emplace one staged key into the table. String-like keys were staged as raw characters
+    /// and are rebuilt here. `key_storage` selects the ownership: at merge time the delayed
+    /// blocks are retained on the shared state until after the merged buckets are converted, so
+    /// string-like keys are emplaced pointing into the staged bytes directly, with no copy; a
+    /// pressure-time drain instead persists them into the arena, because freeing the blocks is
+    /// its purpose. Fixed-size keys were staged as values either way.
+    /// `table` is the bucket's own submap: the records were grouped by the same hash dispatch
+    /// at staging time, so emplacing into it directly skips the per-record two-level routing.
     template <typename Key, DB::AdaptiveKeyStorage key_storage, typename Table>
     void ALWAYS_INLINE emplaceStagedKey(
         Table & table,

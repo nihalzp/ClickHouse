@@ -3,6 +3,8 @@
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnDecimal.h>
 #include <Processors/Transforms/AggregatingTransform.h>
+#include <Processors/Transforms/AdaptiveAggregationAdmissionTransform.h>
+#include <Interpreters/AdaptiveAggregationExecution.h>
 
 #include <Interpreters/AdaptiveAggregationImpl.h>
 
@@ -1125,7 +1127,10 @@ AggregatingTransform::AggregatingTransform(
     /// `AggregatingStep` leaves its engagement verdict in the flag. Without a producer nothing is ever
     /// staged, so the merge-time drains find empty backlogs and do nothing.
     if (many_data->adaptive_session && params->aggregator.getParams().enable_adaptive_aggregator)
+    {
         adaptive_context = std::make_unique<AdaptiveAggregationProducer>(many_data->adaptive_session);
+        adaptive_execution = std::make_unique<AdaptiveAggregationExecution>();
+    }
 }
 
 AggregatingTransform::~AggregatingTransform() = default;
@@ -1148,6 +1153,9 @@ size_t AggregatingTransform::getGeneratingStepGroup() const
 
 IProcessor::Status AggregatingTransform::prepare()
 {
+    if (adaptive_context)
+        return prepareAdaptive();
+
     /// There are one or two input ports.
     /// The first one is used at aggregation step, the second one - while reading merged data from ConvertingAggregated
 
@@ -1226,9 +1234,82 @@ IProcessor::Status AggregatingTransform::prepare()
     return Status::Ready;
 }
 
+IProcessor::Status AggregatingTransform::prepareAdaptive()
+{
+    auto & input = inputs.front();
+    auto & output = outputs.front();
+    if (isCancelled() || output.isFinished())
+    {
+        adaptive_context->session->cancel();
+        input.close();
+        current_chunk.clear();
+        adaptive_context->converter = {};
+        adaptive_execution.reset();
+        many_data.reset();
+        return Status::Finished;
+    }
+
+    auto & execution = *adaptive_execution;
+    if (!output.canPush())
+        return Status::PortFull;
+
+    if (!execution.ready_chunks.empty())
+    {
+        if (execution.next_chunk < execution.ready_chunks.size())
+        {
+            Chunk envelope(output.getHeader().getColumns(), 0);
+            envelope.getChunkInfos().add(std::make_shared<StagedChunkInfo>(
+                std::move(execution.ready_chunks[execution.next_chunk++]), execution.use_own_memory_tracker));
+            output.push(std::move(envelope));
+            return Status::PortFull;
+        }
+
+        /// The last piece was pulled with demand withdrawn. Renewed demand means admission
+        /// finished, including release of the receiver's envelope reference.
+        execution.ready_chunks.clear();
+        execution.next_chunk = 0;
+    }
+
+    if (execution.continuation != AdaptiveAggregationExecution::Continuation::None)
+        return Status::Ready;
+
+    if (is_consume_finished)
+    {
+        input.close();
+        if (execution.finish != AdaptiveAggregationExecution::Finish::Complete)
+            return Status::Ready;
+        output.finish();
+        return Status::Finished;
+    }
+
+    if (read_current_chunk)
+        return Status::Ready;
+    if (input.isFinished())
+    {
+        is_consume_finished = true;
+        return Status::Ready;
+    }
+
+    input.setNeeded();
+    if (!input.hasData())
+        return Status::NeedData;
+    current_chunk = input.pull(/*set_not_needed=*/true);
+    read_current_chunk = true;
+    return Status::Ready;
+}
+
 void AggregatingTransform::work()
 {
-    if (is_consume_finished)
+    if (adaptive_execution && adaptive_execution->continuation != AdaptiveAggregationExecution::Continuation::None)
+    {
+        if (!params->aggregator.resumeAdaptiveBlock(*adaptive_context, *adaptive_execution, variants, no_more_keys))
+            is_consume_finished = true;
+    }
+    else if (adaptive_context && is_consume_finished)
+    {
+        finishAdaptiveAggregation();
+    }
+    else if (is_consume_finished)
     {
         initGenerate();
     }
@@ -1286,16 +1367,14 @@ void AggregatingTransform::consume(Chunk chunk)
                 key_columns,
                 aggregate_columns,
                 no_more_keys,
-                adaptive_context.get()))
+                adaptive_context.get(),
+                adaptive_execution.get()))
             is_consume_finished = true;
     }
 }
 
-void AggregatingTransform::initGenerate()
+void AggregatingTransform::finishLocalAggregation()
 {
-    if (is_generate_initialized.test_and_set())
-        return;
-
     /// If there was no data, and we aggregate without keys, and we must return single row with the result of empty aggregation.
     /// To do this, we pass a block with zero rows to aggregate.
     if (variants.empty() && params->params.keys_size == 0 && !params->params.empty_result_for_aggregation_by_empty_set)
@@ -1328,32 +1407,62 @@ void AggregatingTransform::initGenerate()
             params->aggregator.writeToTemporaryFile(variants);
     }
 
-    bool adaptive_engaged = adaptive_context && adaptive_context->session->initialized.load(std::memory_order_acquire);
-    if (adaptive_engaged)
-    {
-        /// Complete this thread's backlog contribution before the finish barrier below: the last
-        /// finisher assembles the merge assuming every producer's staged records are enqueued.
-        params->aggregator.flushPendingChunks(*adaptive_context);
+}
 
-        if (variants.isConvertibleToTwoLevel())
-            variants.convertToTwoLevel();
-    }
+void AggregatingTransform::initGenerate()
+{
+    if (is_generate_initialized.test_and_set())
+        return;
 
+    finishLocalAggregation();
     if (many_data->num_finished.fetch_add(1) + 1 < many_data->num_producers)
     {
-        /// Note: we reset aggregation state here to release memory earlier.
-        /// It might cause extra memory usage for complex queries othervise.
         many_data.reset();
         return;
     }
 
-    adaptive_engaged = adaptive_context && adaptive_context->session->initialized.load(std::memory_order_acquire);
+    processors = createAggregationMergePipeline(
+        params, many_data, max_threads, temporary_data_merge_threads,
+        should_produce_results_in_order_of_bucket_number, skip_merging, updater, tmp_files);
+}
+
+void AggregatingTransform::finishAdaptiveAggregation()
+{
+    auto & execution = *adaptive_execution;
+    if (execution.finish == AdaptiveAggregationExecution::Finish::NotStarted)
+    {
+        finishLocalAggregation();
+        /// Final flushing has the transform's query tracker, matching the local finish path.
+        execution.use_own_memory_tracker = false;
+        if (adaptive_context->session->initialized.load(std::memory_order_acquire))
+            params->aggregator.flushPendingChunks(*adaptive_context, execution.ready_chunks);
+        execution.finish = AdaptiveAggregationExecution::Finish::AfterFinalFlush;
+        if (!execution.ready_chunks.empty())
+            return;
+    }
+
+    if (adaptive_context->session->initialized.load(std::memory_order_acquire) && variants.isConvertibleToTwoLevel())
+        variants.convertToTwoLevel();
+    execution.finish = AdaptiveAggregationExecution::Finish::Complete;
+    many_data.reset();
+}
+
+Processors createAggregationMergePipeline(
+    const AggregatingTransformParamsPtr & params, const ManyAggregatedDataPtr & many_data,
+    size_t max_threads, size_t temporary_data_merge_threads,
+    bool should_produce_results_in_order_of_bucket_number, bool skip_merging,
+    const RuntimeDataflowStatisticsCacheUpdaterPtr & updater, std::list<TemporaryBlockStreamHolder> & tmp_files)
+{
+    Processors processors;
+    static const auto log = getLogger("AggregatingTransform");
+    const auto & session = many_data->adaptive_session;
+    const bool adaptive_engaged = session && session->initialized.load(std::memory_order_acquire);
 
     if (adaptive_engaged)
         LOG_TRACE(
             log,
             "Adaptive aggregation: {} delayed records queued for the merge-time drain",
-            adaptive_context->session->backlog.undrainedRecords());
+            session->backlog.undrainedRecords());
 
     /// In the case of two different aggregators existing simultaneously due to a mixed pipeline of aggregate projections,
     /// it is necessary to check whether any of the aggregators contains temporary data.
@@ -1368,7 +1477,7 @@ void AggregatingTransform::initGenerate()
 
     if (adaptive_engaged)
     {
-        auto & shared = *adaptive_context->session;
+        auto & shared = *session;
 
         /// The producers' final flushes run after their own spill checks, and a flush's seal
         /// copies can push memory over the external threshold with nothing re-checking. Re-check
@@ -1393,10 +1502,8 @@ void AggregatingTransform::initGenerate()
         }
         if (shared.early_drain_variants->hasData())
         {
-            /// Early-drained records live in the routing table: it holds part of the result
-            /// and joins the merge set like any other variant. Only the last finisher gets
-            /// here, so growing `variants` is safe as long as nothing else reads it - hence
-            /// the barrier above counts `num_producers` rather than the size of this vector.
+            /// Production is complete. The routing table contributes its early-drained states
+            /// to the same merge set as the producer tables.
             many_data->variants.push_back(shared.early_drain_variants);
         }
     }
@@ -1406,10 +1513,10 @@ void AggregatingTransform::initGenerate()
         if (!skip_merging)
         {
             auto prepared_data = params->aggregator.prepareVariantsToMerge(
-                std::move(many_data->variants), adaptive_context ? adaptive_context->session.get() : nullptr);
+                std::move(many_data->variants), session.get());
             auto prepared_data_ptr = std::make_shared<ManyAggregatedDataVariants>(std::move(prepared_data));
             processors.emplace_back(std::make_shared<ConvertingAggregatedToChunksTransform>(
-                params, std::move(prepared_data_ptr), max_threads, updater, adaptive_engaged ? adaptive_context->session : nullptr));
+                params, std::move(prepared_data_ptr), max_threads, updater, adaptive_engaged ? session : nullptr));
         }
         else
         {
@@ -1441,7 +1548,7 @@ void AggregatingTransform::initGenerate()
                     if (params->final)
                     {
                         pipe.addSimpleTransform(
-                            [this](const SharedHeader & header)
+                            [params](const SharedHeader & header)
                             {
                                 /// Just a reasonable constant, matches default value for the setting `preferred_block_size_bytes`
                                 static constexpr size_t oneMB = 1024 * 1024;
@@ -1515,6 +1622,7 @@ void AggregatingTransform::initGenerate()
 
         processors = Pipe::detachProcessors(std::move(pipe));
     }
+    return processors;
 }
 
 }

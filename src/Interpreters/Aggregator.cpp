@@ -1,3 +1,4 @@
+#include <utility>
 #include <optional>
 #include <unordered_map>
 #include <Core/Settings.h>
@@ -26,6 +27,7 @@
 #include <IO/Operators.h>
 #include <Interpreters/AggregationUtils.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
+#include <Interpreters/AdaptiveAggregationExecution.h>
 #include <Interpreters/Aggregator.h>
 #include <Processors/QueryPlan/QueryPlanFormat.h>
 #include <Interpreters/JIT/CompiledExpressionCache.h>
@@ -2217,7 +2219,8 @@ bool Aggregator::executeOnBlock(Columns columns,
     ColumnRawPtrs & key_columns,
     AggregateColumns & aggregate_columns,
     bool & no_more_keys,
-    AdaptiveAggregationProducer * adaptive) const
+    AdaptiveAggregationProducer * adaptive,
+    AdaptiveAggregationExecution * execution) const
 {
     /// When tracking the aggregation memory, the aggregator memory tracker is inserted between the thread
     /// and query memory trackers, and accounts for the aggregation state across all threads.
@@ -2226,6 +2229,9 @@ bool Aggregator::executeOnBlock(Columns columns,
     std::optional<MemoryTrackerSwitcher> memory_tracker_switcher;
     if (use_own_tracker)
         memory_tracker_switcher.emplace(memory_tracker.get());
+
+    if (execution)
+        execution->use_own_memory_tracker = use_own_tracker;
 
     /// `result` will destroy the states of aggregate functions in the destructor
     result.aggregator = this;
@@ -2308,7 +2314,8 @@ bool Aggregator::executeOnBlock(Columns columns,
         /// The frozen adaptive path: hits update the local table in place, misses become delayed
         /// records of the shared table.
         executeFrozen(
-            columns, row_begin, row_end, result, key_columns, aggregate_functions_instructions.data(), *adaptive, all_keys_are_const);
+            columns, row_begin, row_end, result, key_columns, aggregate_functions_instructions.data(),
+            *adaptive, execution->ready_chunks, all_keys_are_const);
     }
     else if (adaptive && adaptive->isLearning() && result.isConvertibleToTwoLevel() && !all_keys_are_const
              && result.sizeWithoutOverflowRow() + (row_end - row_begin) > params.adaptive_aggregator_freeze_threshold)
@@ -2353,6 +2360,7 @@ bool Aggregator::executeOnBlock(Columns columns,
                     key_columns,
                     aggregate_functions_instructions.data(),
                     *adaptive,
+                    execution->ready_chunks,
                     /*all_keys_are_const=*/false);
             }
         }
@@ -2364,17 +2372,52 @@ bool Aggregator::executeOnBlock(Columns columns,
         executeImpl(result, row_begin, row_end, key_columns, aggregate_functions_instructions.data(), no_more_keys, all_keys_are_const, overflow_row_ptr);
     }
 
-    size_t result_size = result.sizeWithoutOverflowRow();
-    Int64 current_memory_usage = getCurrentQueryMemoryUsage();
+    bool should_continue = true;
+    if (execution)
+        execution->input_rows = row_end - row_begin;
 
-    /// Here all the results in the sum are taken into account, from different threads.
-    Int64 result_size_bytes = use_own_tracker ? memory_tracker->get() : current_memory_usage - memory_usage_before_aggregation;
+    /// Ready chunks must be admitted before the memory snapshot. Small pending candidates
+    /// remain in the converter until its normal seal or an existing pressure/finish flush.
+    if (execution && !execution->ready_chunks.empty())
+    {
+        execution->continuation = AdaptiveAggregationExecution::Continuation::BeforeMemoryCheck;
+    }
+    else
+    {
+        const size_t result_size = result.sizeWithoutOverflowRow();
+        const Int64 current_memory_usage = getCurrentQueryMemoryUsage();
+        const Int64 result_size_bytes = use_own_tracker ? memory_tracker->get() : current_memory_usage - memory_usage_before_aggregation;
+        should_continue = finishOnBlock(
+            result, no_more_keys, row_end - row_begin, result_size, current_memory_usage, result_size_bytes, adaptive, execution);
+    }
+
+    if (execution && execution->continuation != AdaptiveAggregationExecution::Continuation::None)
+    {
+        execution->columns = std::move(columns);
+        execution->materialized_columns = std::move(materialized_columns);
+        execution->nested_columns_holder = std::move(nested_columns_holder);
+        execution->instructions = std::move(aggregate_functions_instructions);
+    }
+    return should_continue;
+}
+
+bool Aggregator::finishOnBlock(
+    AggregatedDataVariants & result, bool & no_more_keys, size_t input_rows,
+    size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
+    AdaptiveAggregationProducer * adaptive, AdaptiveAggregationExecution * execution) const
+{
+    if (execution)
+    {
+        execution->result_size = result_size;
+        execution->current_memory_usage = current_memory_usage;
+        execution->result_size_bytes = result_size_bytes;
+    }
 
     if (adaptive && !adaptive->isBaseline())
     {
         if (adaptive->session->thaw_all.load(std::memory_order_relaxed))
         {
-            /// The staged stream proved repeat-dominated (see `publishDelayedRecords`): thaw and
+            /// The staged stream proved repeat-dominated (see `stageDelayedRecords`): thaw and
             /// return to the baseline checks below, permanently. The table resumes ordinary
             /// insertion; the records staged so far stay published and the merge drains them.
             /// A thread that has not frozen yet stands down the same way, so that it does not
@@ -2415,7 +2458,12 @@ bool Aggregator::executeOnBlock(Columns columns,
                 if (params.max_bytes_before_external_group_by
                     && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by))
                 {
-                    flushPendingChunks(*adaptive);
+                    flushPendingChunks(*adaptive, execution->ready_chunks);
+                    if (!execution->ready_chunks.empty())
+                    {
+                        execution->continuation = AdaptiveAggregationExecution::Continuation::FrozenPressureDrain;
+                        return true;
+                    }
                     drainStagedChunksUnderMemoryPressure(*adaptive->session);
                 }
 
@@ -2433,7 +2481,7 @@ bool Aggregator::executeOnBlock(Columns columns,
             /// bucket-parallel merge), or the hot share is so extreme that staging the sliver of
             /// a tail cannot pay. The thread falls back to the baseline checks below, permanently.
             auto & learning = std::get<AdaptiveAggregationProducer::LearningState>(adaptive->phase);
-            learning.rows_seen += row_end - row_begin;
+            learning.rows_seen += input_rows;
             if (learning.rows_seen >= adaptive_freeze_give_up_row_multiple * params.adaptive_aggregator_freeze_threshold
                 && result_size < params.adaptive_aggregator_freeze_threshold)
             {
@@ -2483,13 +2531,26 @@ bool Aggregator::executeOnBlock(Columns columns,
         && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by)
         && adaptive->session->initialized.load(std::memory_order_acquire))
     {
-        flushPendingChunks(*adaptive);
+        flushPendingChunks(*adaptive, execution->ready_chunks);
+        if (!execution->ready_chunks.empty())
+        {
+            execution->continuation = AdaptiveAggregationExecution::Continuation::BaselinePressureDrain;
+            return true;
+        }
         /// Every later block reaches this trigger too, with the backlog already down to what no
         /// sweep writes, so the event counts the records taken out and not the arrivals here.
         if (drainStagedChunksUnderMemoryPressure(*adaptive->session))
             ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
     }
 
+    return finishBaselineBlock(result, no_more_keys, result_size, current_memory_usage, result_size_bytes, adaptive);
+}
+
+bool Aggregator::finishBaselineBlock(
+    AggregatedDataVariants & result, bool & no_more_keys,
+    size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
+    AdaptiveAggregationProducer * adaptive) const
+{
     bool worth_convert_to_two_level = worthConvertToTwoLevel(
         params.group_by_two_level_threshold, result_size, params.group_by_two_level_threshold_bytes, result_size_bytes);
 
@@ -2530,6 +2591,55 @@ bool Aggregator::executeOnBlock(Columns columns,
     }
 
     return true;
+}
+
+bool Aggregator::resumeAdaptiveBlock(
+    AdaptiveAggregationProducer & adaptive, AdaptiveAggregationExecution & execution,
+    AggregatedDataVariants & result, bool & no_more_keys) const
+{
+    std::optional<MemoryTrackerSwitcher> memory_tracker_switcher;
+    if (execution.use_own_memory_tracker)
+        memory_tracker_switcher.emplace(memory_tracker.get());
+
+    const auto continuation = std::exchange(execution.continuation, AdaptiveAggregationExecution::Continuation::None);
+    bool should_continue = true;
+    switch (continuation)
+    {
+        case AdaptiveAggregationExecution::Continuation::BeforeMemoryCheck:
+        {
+            const size_t result_size = result.sizeWithoutOverflowRow();
+            const Int64 current_memory_usage = getCurrentQueryMemoryUsage();
+            const Int64 result_size_bytes = execution.use_own_memory_tracker
+                ? memory_tracker->get() : current_memory_usage - memory_usage_before_aggregation;
+            should_continue = finishOnBlock(
+                result, no_more_keys, execution.input_rows, result_size, current_memory_usage, result_size_bytes, &adaptive, &execution);
+            break;
+        }
+        case AdaptiveAggregationExecution::Continuation::FrozenPressureDrain:
+            drainStagedChunksUnderMemoryPressure(*adaptive.session);
+            should_continue = checkLimits(execution.result_size, no_more_keys);
+            break;
+        case AdaptiveAggregationExecution::Continuation::BaselinePressureDrain:
+            if (drainStagedChunksUnderMemoryPressure(*adaptive.session))
+                ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
+            should_continue = finishBaselineBlock(
+                result, no_more_keys, execution.result_size, execution.current_memory_usage, execution.result_size_bytes, &adaptive);
+            break;
+        case AdaptiveAggregationExecution::Continuation::None:
+            std::unreachable();
+    }
+
+    if (execution.continuation == AdaptiveAggregationExecution::Continuation::None)
+    {
+        /// Block-local storage is destroyed under the aggregation tracker. The input columns
+        /// are a function parameter in `executeOnBlock`, so their destruction follows the switcher.
+        execution.instructions = AggregateFunctionInstructions{};
+        execution.nested_columns_holder = NestedColumnsHolder{};
+        execution.materialized_columns = Columns{};
+        memory_tracker_switcher.reset();
+        execution.columns = Columns{};
+    }
+    return should_continue;
 }
 
 void Aggregator::writeToTemporaryFile(AggregatedDataVariants & data_variants, size_t max_temp_file_size) const
