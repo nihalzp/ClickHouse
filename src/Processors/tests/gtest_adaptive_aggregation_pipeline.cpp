@@ -172,24 +172,37 @@ TEST(AdaptiveAggregationPipeline, CompletionWaitsForPulledPayload)
     EXPECT_EQ(many_data->adaptive_session->backlog.undrainedRecords(), 1);
 }
 
-TEST(AdaptiveAggregationPipeline, CancellationReleasesUnregisteredPayload)
+TEST(AdaptiveAggregationPipeline, CancellationReleasesQueuedAndPulledPayloads)
 {
-    auto header = makeHeader();
-    auto params = makeParams(header);
-    auto session = std::make_shared<AdaptiveAggregationSession>();
-    Admission admission(header, params, session);
-    EXPECT_EQ(admission.processor.prepare(), IProcessor::Status::NeedData);
-    auto chunk = makeStagedChunk();
-    std::weak_ptr<const StagedChunk> weak = chunk;
-    admission.producer.push(envelope(header, std::move(chunk)));
-    EXPECT_EQ(admission.processor.prepare(), IProcessor::Status::Ready);
-    EXPECT_FALSE(weak.expired());
-    admission.completion.close();
-    EXPECT_EQ(admission.processor.prepare(), IProcessor::Status::Finished);
-    EXPECT_TRUE(weak.expired());
-    EXPECT_TRUE(session->cancelled.load());
-    EXPECT_TRUE(admission.producer.isFinished());
-    EXPECT_EQ(session->backlog.undrainedRecords(), 0);
+    for (const bool pulled : {false, true})
+    {
+        for (const bool cancelled : {false, true})
+        {
+            SCOPED_TRACE(pulled);
+            SCOPED_TRACE(cancelled);
+            auto header = makeHeader();
+            auto params = makeParams(header);
+            auto session = std::make_shared<AdaptiveAggregationSession>();
+            Admission admission(header, params, session);
+            ASSERT_EQ(admission.processor.prepare(), IProcessor::Status::NeedData);
+            auto chunk = makeStagedChunk();
+            std::weak_ptr<const StagedChunk> weak = chunk;
+            admission.producer.push(envelope(header, std::move(chunk)));
+            if (pulled)
+                ASSERT_EQ(admission.processor.prepare(), IProcessor::Status::Ready);
+            EXPECT_FALSE(weak.expired());
+            if (cancelled)
+                admission.processor.cancel();
+            else
+                admission.completion.close();
+            EXPECT_EQ(admission.processor.prepare(), IProcessor::Status::Finished);
+            EXPECT_TRUE(weak.expired());
+            EXPECT_TRUE(session->cancelled.load());
+            EXPECT_TRUE(admission.producer.isFinished());
+            EXPECT_FALSE(admission.processor.getInputs().front().hasData());
+            EXPECT_EQ(session->backlog.undrainedRecords(), 0);
+        }
+    }
 }
 
 TEST(AdaptiveAggregationPipeline, CompletesAtSingleAndMultipleExecutorThreads)
@@ -229,5 +242,41 @@ TEST(AdaptiveAggregationPipeline, CompletesAtSingleAndMultipleExecutorThreads)
         constexpr UInt64 expected_rows = 70000 + 8192 + 140000;
         EXPECT_EQ(sink->rows, expected_rows);
         EXPECT_EQ(sink->sum, expected_rows * (expected_rows - 1) / 2);
+    }
+}
+
+TEST(AdaptiveAggregationPipeline, CancellationReleasesProducerOutboxAndSuspendedInput)
+{
+    for (const bool published : {false, true})
+    {
+        SCOPED_TRACE(published);
+        auto header = makeHeader();
+        auto params = makeParams(header);
+        auto many_data = std::make_shared<ManyAggregatedData>(2);
+        auto session = std::make_shared<AdaptiveAggregationSession>();
+        many_data->adaptive_session = session;
+        AggregatingTransform producer(header, params, many_data, 0, 2, 2, false, false, nullptr);
+        AdaptiveAggregationAdmissionTransform admission(header, params, session);
+        OutputPort source(header);
+        InputPort completion(header);
+        connect(source, producer.getInputs().front());
+        connect(producer.getOutputs().front(), admission.getInputs().front());
+        connect(admission.getOutputs().front(), completion);
+        ASSERT_EQ(admission.prepare(), IProcessor::Status::NeedData);
+        ASSERT_EQ(producer.prepare(), IProcessor::Status::NeedData);
+        auto input = keyRange(0, 150000);
+        auto owner = input.getColumns().front();
+        source.push(std::move(input));
+        ASSERT_EQ(producer.prepare(), IProcessor::Status::Ready);
+        producer.work();
+        EXPECT_GT(owner->use_count(), 1);
+        if (published)
+            ASSERT_EQ(producer.prepare(), IProcessor::Status::PortFull);
+        completion.close();
+        ASSERT_EQ(admission.prepare(), IProcessor::Status::Finished);
+        ASSERT_EQ(producer.prepare(), IProcessor::Status::Finished);
+        EXPECT_EQ(owner->use_count(), 1);
+        EXPECT_TRUE(source.isFinished());
+        EXPECT_EQ(session->backlog.undrainedRecords(), 0);
     }
 }

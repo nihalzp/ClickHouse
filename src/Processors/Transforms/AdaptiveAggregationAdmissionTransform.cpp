@@ -21,6 +21,8 @@ IProcessor::Status AdaptiveAggregationAdmissionTransform::prepare()
     {
         session->cancel();
         input.close();
+        if (input.hasData())
+            input.pullData(/*set_not_needed=*/true);
         current_chunk.clear();
         has_current_chunk = false;
         return Status::Finished;
