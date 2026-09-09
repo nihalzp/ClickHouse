@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <functional>
 #include <future>
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/CurrentThread.h>
+#include <Common/FailPoint.h>
 #include <Common/MemoryTrackerSwitcher.h>
 #include <Common/MemoryTrackerUtils.h>
 #include <Common/ThreadGroupSwitcher.h>
@@ -14,8 +16,11 @@
 #include <Common/tests/gtest_global_context.h>
 #include <Common/tests/gtest_global_register.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Disks/SingleDiskVolume.h>
+#include <Disks/tests/gtest_disk.h>
 #include <Interpreters/AdaptiveAggregationExecution.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
+#include <Interpreters/TemporaryDataOnDisk.h>
 #include <Processors/Executors/Runtime/PipelineExecutor.h>
 #include <Processors/ISink.h>
 #include <Processors/Sources/SourceFromChunks.h>
@@ -24,6 +29,11 @@
 #include <base/scope_guard.h>
 
 using namespace DB;
+
+namespace DB::FailPoints
+{
+extern const char adaptive_aggregation_before_spill_budget_wait[];
+}
 
 namespace ProfileEvents
 {
@@ -40,7 +50,7 @@ SharedHeader makeHeader()
 }
 
 AggregatingTransformParamsPtr makeParams(
-    const SharedHeader & header, size_t external_threshold = 0, const String & aggregate = {})
+    const SharedHeader & header, size_t external_threshold = 0, const String & aggregate = {}, TemporaryDataOnDiskScopePtr tmp_data = {})
 {
     AggregateDescriptions aggregates;
     if (!aggregate.empty())
@@ -63,6 +73,7 @@ AggregatingTransformParamsPtr makeParams(
         /*max_block_size_=*/65536, /*min_hit_rate_to_use_consecutive_keys_optimization_=*/0.5f,
         /*serialize_string_with_zero_byte_=*/false, /*enable_packed_string_keys_=*/true);
     params.max_bytes_before_external_group_by = external_threshold;
+    params.tmp_data_scope = std::move(tmp_data);
     params.only_merge = false;
     params.enable_adaptive_aggregator = true;
     params.adaptive_aggregator_freeze_threshold = 64;
@@ -573,5 +584,175 @@ TEST(AdaptiveAggregationPipeline, CancellationReleasesProducerOutboxAndSuspended
         EXPECT_EQ(owner->use_count(), 1);
         EXPECT_TRUE(source.isFinished());
         EXPECT_EQ(session->backlog.undrainedRecords(), 0);
+    }
+}
+
+#if USE_LIBFIU
+TEST(AdaptiveAggregationPipeline, CancellationWakesPressureWorkWaitingForSpillBudget)
+{
+    MainThreadStatus::getInstance();
+    MemoryTracker query_tracker(nullptr, VariableContext::Process, false);
+    MemoryTrackerSwitcher query_scope(&query_tracker);
+    auto header = makeHeader();
+    auto params = makeParams(header, 64 << 20);
+    BlockExecution block(params);
+    ASSERT_TRUE(block.execute(keyRange(0, 8192)));
+    ASSERT_TRUE(block.execute(keyRange(8192, 700000)));
+    ASSERT_GT(block.execution.ready_chunks.size(), 1);
+    block.admit(query_tracker);
+    constexpr Int64 pressure_bytes = 128 << 20;
+    query_tracker.adjustWithUntrackedMemory(pressure_bytes);
+    SCOPE_EXIT({ query_tracker.adjustWithUntrackedMemory(-pressure_bytes); });
+    block.resume(query_tracker);
+    ASSERT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::FrozenPressureDrain);
+    block.admit(query_tracker);
+
+    AdaptiveAggregationSession::SpillReservation writer;
+    ASSERT_TRUE(writer.reserveOrWait(*block.session, pressure_bytes, pressure_bytes));
+    Admission admission(header, params, block.session);
+    FailPointInjection::enableFailPoint(FailPoints::adaptive_aggregation_before_spill_budget_wait);
+    auto worker = std::async(std::launch::async, [&]
+    {
+        ThreadStatus thread_status;
+        MemoryTrackerSwitcher switcher(&query_tracker);
+        return params->aggregator.resumeAdaptiveBlock(block.adaptive, block.execution, block.result, block.no_more_keys);
+    });
+    SCOPE_EXIT({
+        FailPointInjection::disableFailPoint(FailPoints::adaptive_aggregation_before_spill_budget_wait);
+        block.session->cancel();
+    });
+    FailPointInjection::waitForPause(FailPoints::adaptive_aggregation_before_spill_budget_wait);
+    FailPointInjection::notifyFailPoint(FailPoints::adaptive_aggregation_before_spill_budget_wait);
+    {
+        /// The predicate holds this mutex at the failpoint. Acquiring it after resumption proves
+        /// the worker entered the condition-variable wait while the other writer still owns the budget.
+        std::lock_guard lock(block.session->detached_spill_mutex);
+        EXPECT_EQ(block.session->estimated_detached_spill_bytes, pressure_bytes);
+    }
+    admission.processor.cancel();
+    const auto status = worker.wait_for(std::chrono::seconds(10));
+    EXPECT_EQ(status, std::future_status::ready);
+    /// Release the other writer even on failure so a missing cancellation notification cannot hang teardown.
+    writer.release();
+    EXPECT_TRUE(worker.get());
+    EXPECT_TRUE(block.session->cancelled.load());
+    EXPECT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::None);
+    EXPECT_TRUE(block.execution.columns.empty());
+    EXPECT_FALSE(params->aggregator.hasTemporaryData());
+    EXPECT_EQ(block.session->estimated_detached_spill_bytes, 0);
+}
+#endif
+
+TEST(AdaptiveAggregationPipeline, FinalAssemblyIncludesLateSpillsAndOwnsTemporaryFiles)
+{
+    MainThreadStatus::getInstance();
+    for (const bool late_producer_spill : {false, true})
+    {
+        SCOPED_TRACE(late_producer_spill);
+        auto disk = createDisk("adaptive_aggregation_final_merge");
+        SCOPE_EXIT({ destroyDisk(disk); });
+        auto volume = std::make_shared<SingleDiskVolume>("volume", disk);
+        auto tmp_data = std::make_shared<TemporaryDataOnDiskScope>(TemporaryDataOnDiskSettings{}, volume);
+        MemoryTracker query_tracker(nullptr, VariableContext::Process, false);
+        MemoryTrackerSwitcher query_scope(&query_tracker);
+        constexpr size_t num_producers = 9;
+        constexpr size_t rows_per_producer = 125000;
+        constexpr size_t external_threshold = 64 << 20;
+        auto header = makeHeader();
+        auto params = makeParams(header, external_threshold, {}, tmp_data);
+        auto many_data = std::make_shared<ManyAggregatedData>(num_producers);
+        auto session = std::make_shared<AdaptiveAggregationSession>();
+        many_data->adaptive_session = session;
+        auto merge = std::make_unique<AdaptiveAggregationMergeTransform>(params, many_data, 2, 2, nullptr);
+        InputPort result(header);
+        connect(merge->getOutputs().front(), result);
+        std::vector<std::unique_ptr<AggregatingTransform>> producers;
+        std::vector<std::unique_ptr<AdaptiveAggregationAdmissionTransform>> admissions;
+        std::vector<std::unique_ptr<OutputPort>> sources;
+        IProcessor::UpdatedInputPorts completion_inputs;
+        auto completion = merge->getInputs().begin();
+        for (size_t i = 0; i < num_producers; ++i)
+        {
+            auto producer = std::make_unique<AggregatingTransform>(header, params, many_data, i, 2, 2, false, false, nullptr);
+            auto admission = std::make_unique<AdaptiveAggregationAdmissionTransform>(header, params, session);
+            auto source = std::make_unique<OutputPort>(header);
+            connect(*source, producer->getInputs().front());
+            connect(producer->getOutputs().front(), admission->getInputs().front());
+            connect(admission->getOutputs().front(), *completion);
+            completion_inputs.push_back(&*completion++);
+            ASSERT_EQ(admission->prepare(), IProcessor::Status::NeedData);
+            ASSERT_EQ(producer->prepare(), IProcessor::Status::NeedData);
+            source->push(keyRange(i * rows_per_producer, rows_per_producer));
+            ASSERT_EQ(producer->prepare(), IProcessor::Status::Ready);
+            producer->work();
+            ASSERT_EQ(producer->prepare(), IProcessor::Status::NeedData);
+            sources.push_back(std::move(source));
+            producers.push_back(std::move(producer));
+            admissions.push_back(std::move(admission));
+        }
+        ASSERT_EQ(merge->prepare({}, {}), IProcessor::Status::NeedData);
+        Int64 pressure_adjustment = 0;
+        SCOPE_EXIT({ query_tracker.adjustWithUntrackedMemory(-pressure_adjustment); });
+        for (size_t i = 0; i < num_producers; ++i)
+        {
+            SCOPED_TRACE(i);
+            if (late_producer_spill && i == 1)
+            {
+                /// The first producer has finished with a resident table when the next producer spills.
+                ASSERT_TRUE(many_data->variants.front()->hasData());
+                many_data->variants[i]->convertToTwoLevel();
+                params->aggregator.writeToTemporaryFile(*many_data->variants[i]);
+            }
+            sources[i]->finish();
+            ASSERT_EQ(producers[i]->prepare(), IProcessor::Status::Ready);
+            producers[i]->work();
+            ASSERT_EQ(producers[i]->prepare(), IProcessor::Status::PortFull);
+            ASSERT_EQ(admissions[i]->prepare(), IProcessor::Status::Ready);
+            if (!late_producer_spill && i + 1 == num_producers)
+            {
+                /// Registration of the ninth final flush grows the per-bucket backlog vectors.
+                /// Put the query just below its threshold so that this admission crosses it.
+                CurrentThread::flushUntrackedMemory();
+                pressure_adjustment = external_threshold - 1 - getCurrentQueryMemoryUsage();
+                query_tracker.adjustWithUntrackedMemory(pressure_adjustment);
+            }
+            admissions[i]->work();
+            CurrentThread::flushUntrackedMemory();
+            if (!late_producer_spill && i + 1 == num_producers)
+                ASSERT_GT(getCurrentQueryMemoryUsage(), external_threshold);
+            ASSERT_EQ(admissions[i]->prepare(), IProcessor::Status::NeedData);
+            ASSERT_EQ(producers[i]->prepare(), IProcessor::Status::Ready);
+            producers[i]->work();
+            ASSERT_EQ(producers[i]->prepare(), IProcessor::Status::Finished);
+            ASSERT_EQ(admissions[i]->prepare(), IProcessor::Status::Finished);
+            EXPECT_EQ(merge->prepare({completion_inputs[i]}, {}), i + 1 == num_producers
+                ? IProcessor::Status::Ready : IProcessor::Status::NeedData);
+        }
+        ASSERT_EQ(params->aggregator.hasTemporaryData(), late_producer_spill);
+        merge->work();
+        ASSERT_EQ(merge->prepare({}, {}), IProcessor::Status::UpdatePipeline);
+        ASSERT_GT(tmp_data->currentCompressedSize(), 0);
+        EXPECT_FALSE(params->aggregator.hasTemporaryData());
+        EXPECT_EQ(session->backlog.undrainedRecords(), 0);
+
+        /// Execute the assembled readers while the coordinator retains their temporary-file holders.
+        auto update = merge->updatePipeline();
+        auto & output = update.to_add.back()->getOutputs().front();
+        disconnect(output, merge->getInputs().back());
+        auto sink = std::make_shared<KeySink>(header);
+        connect(output, sink->getPort());
+        auto processors = std::make_shared<Processors>(std::move(update.to_add));
+        processors->push_back(sink);
+        {
+            PipelineExecutor executor(processors, QueryStatusPtr{});
+            executor.execute(1, false);
+        }
+        constexpr UInt64 expected_rows = num_producers * rows_per_producer;
+        EXPECT_EQ(sink->rows, expected_rows);
+        EXPECT_EQ(sink->sum, expected_rows * (expected_rows - 1) / 2);
+        processors.reset();
+        EXPECT_GT(tmp_data->currentCompressedSize(), 0);
+        merge.reset();
+        EXPECT_EQ(tmp_data->currentCompressedSize(), 0);
     }
 }

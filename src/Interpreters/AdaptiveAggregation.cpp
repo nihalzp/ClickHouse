@@ -2,6 +2,7 @@
 
 #include <Columns/IColumn.h>
 #include <Common/Arena.h>
+#include <Common/FailPoint.h>
 #include <Common/MemoryTrackerSwitcher.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
@@ -16,6 +17,29 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace FailPoints
+{
+extern const char adaptive_aggregation_before_spill_budget_wait[];
+}
+
+bool AdaptiveAggregationSession::SpillReservation::reserveOrWait(
+    AdaptiveAggregationSession & session_, size_t bytes_, size_t budget_)
+{
+    std::unique_lock lock(session_.detached_spill_mutex);
+    session_.detached_spill_cv.wait(lock, [&]
+    {
+        const bool ready = fits(session_, bytes_, budget_) || session_.cancelled.load(std::memory_order_relaxed);
+        if (!ready)
+            fiu_do_on(FailPoints::adaptive_aggregation_before_spill_budget_wait,
+                FailPointInjection::notifyPauseAndWaitForResume(FailPoints::adaptive_aggregation_before_spill_budget_wait););
+        return ready;
+    });
+    if (session_.cancelled.load(std::memory_order_relaxed) || !fits(session_, bytes_, budget_))
+        return false;
+    grab(session_, bytes_);
+    return true;
+}
 
 void Aggregator::prepareStagedChunk(StagedChunk & block) const
 {

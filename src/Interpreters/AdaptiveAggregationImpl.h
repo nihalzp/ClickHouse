@@ -201,16 +201,7 @@ struct AdaptiveAggregationSession
         /// one oversized table cannot deadlock the valve. The budget is passed in because it
         /// is derived from the aggregator's external-aggregation threshold, which the session
         /// does not carry (see `Aggregator::adaptivePressureDetachedBytesBudget`).
-        bool reserveOrWait(AdaptiveAggregationSession & session_, size_t bytes_, size_t budget_)
-        {
-            std::unique_lock lock(session_.detached_spill_mutex);
-            session_.detached_spill_cv.wait(
-                lock, [&] { return fits(session_, bytes_, budget_) || session_.cancelled.load(std::memory_order_relaxed); });
-            if (session_.cancelled.load(std::memory_order_relaxed) || !fits(session_, bytes_, budget_))
-                return false;
-            grab(session_, bytes_);
-            return true;
-        }
+        bool reserveOrWait(AdaptiveAggregationSession & session_, size_t bytes_, size_t budget_);
 
         /// Corrects the reservation to the built table's real footprint.
         void resize(size_t bytes_)
