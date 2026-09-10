@@ -1138,10 +1138,10 @@ AggregatingTransform::AggregatingTransform(
     , skip_merging(skip_merging_)
     , updater(std::move(updater_))
 {
-    /// `AggregatingStep` leaves its engagement verdict in the flag. Without a producer nothing is ever
-    /// staged, so the merge-time drains find empty backlogs and do nothing.
-    if (many_data->adaptive_session && params->aggregator.getParams().enable_adaptive_aggregator)
+    /// A session selects the adaptive producer and its dedicated admission protocol.
+    if (many_data->adaptive_session)
     {
+        chassert(params->aggregator.getParams().enable_adaptive_aggregator);
         adaptive_context = std::make_unique<AdaptiveAggregationProducer>(many_data->adaptive_session);
         adaptive_execution = std::make_unique<AdaptiveAggregationExecution>(*adaptive_context);
     }
@@ -1271,11 +1271,11 @@ IProcessor::Status AggregatingTransform::prepareAdaptive()
 
     if (!execution.ready_chunks.empty())
     {
-        if (execution.next_chunk < execution.ready_chunks.size())
+        if (next_ready_chunk < execution.ready_chunks.size())
         {
             Chunk envelope(output.getHeader().getColumns(), 0);
             envelope.getChunkInfos().add(std::make_shared<StagedChunkInfo>(
-                std::move(execution.ready_chunks[execution.next_chunk++]), execution.use_own_memory_tracker));
+                std::move(execution.ready_chunks[next_ready_chunk++]), execution.use_own_memory_tracker));
             output.push(std::move(envelope));
             return Status::PortFull;
         }
@@ -1283,16 +1283,16 @@ IProcessor::Status AggregatingTransform::prepareAdaptive()
         /// The last piece was pulled with demand withdrawn. Renewed demand means admission
         /// finished, including release of the receiver's envelope reference.
         execution.ready_chunks.clear();
-        execution.next_chunk = 0;
+        next_ready_chunk = 0;
     }
 
-    if (execution.continuation != AdaptiveAggregationExecution::Continuation::None)
+    if (execution.hasPendingBlock())
         return Status::Ready;
 
     if (is_consume_finished)
     {
         input.close();
-        if (execution.finish != AdaptiveAggregationExecution::Finish::Complete)
+        if (adaptive_finish_stage != AdaptiveFinishStage::Complete)
             return Status::Ready;
         output.finish();
         return Status::Finished;
@@ -1316,7 +1316,7 @@ IProcessor::Status AggregatingTransform::prepareAdaptive()
 
 void AggregatingTransform::work()
 {
-    if (adaptive_execution && adaptive_execution->continuation != AdaptiveAggregationExecution::Continuation::None)
+    if (adaptive_execution && adaptive_execution->hasPendingBlock())
     {
         if (!params->aggregator.resumeAdaptiveBlock(*adaptive_execution, variants, no_more_keys))
             is_consume_finished = true;
@@ -1421,7 +1421,6 @@ void AggregatingTransform::finishLocalAggregation()
         if (variants.hasData())
             params->aggregator.writeToTemporaryFile(variants);
     }
-
 }
 
 void AggregatingTransform::initGenerate()
@@ -1444,21 +1443,23 @@ void AggregatingTransform::initGenerate()
 void AggregatingTransform::finishAdaptiveAggregation()
 {
     auto & execution = *adaptive_execution;
-    if (execution.finish == AdaptiveAggregationExecution::Finish::NotStarted)
+    chassert(!execution.hasPendingBlock() && execution.ready_chunks.empty());
+    if (adaptive_finish_stage == AdaptiveFinishStage::NotStarted)
     {
         finishLocalAggregation();
-        /// Final flushing has the transform's query tracker, matching the local finish path.
+        /// `finishLocalAggregation` runs under the query tracker. Charge final chunk preparation
+        /// and admission there as well; the block's aggregation account is no longer used for checks.
         execution.use_own_memory_tracker = false;
         if (adaptive_context->session->initialized.load(std::memory_order_acquire))
             params->aggregator.flushPendingChunks(execution);
-        execution.finish = AdaptiveAggregationExecution::Finish::AfterFinalFlush;
+        adaptive_finish_stage = AdaptiveFinishStage::AfterFinalFlush;
         if (!execution.ready_chunks.empty())
             return;
     }
 
     if (adaptive_context->session->initialized.load(std::memory_order_acquire) && variants.isConvertibleToTwoLevel())
         variants.convertToTwoLevel();
-    execution.finish = AdaptiveAggregationExecution::Finish::Complete;
+    adaptive_finish_stage = AdaptiveFinishStage::Complete;
     many_data.reset();
 }
 
@@ -1494,11 +1495,9 @@ Processors createAggregationMergePipeline(
     {
         auto & shared = *session;
 
-        /// The producers' final flushes run after their own spill checks, and a flush's seal
-        /// copies can push memory over the external threshold with nothing re-checking. Re-check
-        /// here, after every producer flushed and before the merge path is chosen: the sweep
-        /// no-ops under the trigger, sheds staged records when over it, and spills the routing
-        /// table if shedding is not enough - which makes the choice below go external.
+        /// Final coalescing and admission follow each producer's spill checks and can cross the
+        /// external threshold. Drain under pressure before choosing the merge path, so any spills
+        /// from this last sweep select the external merge.
         if (params->params.max_bytes_before_external_group_by)
             params->aggregator.drainStagedChunksUnderMemoryPressure(shared);
 

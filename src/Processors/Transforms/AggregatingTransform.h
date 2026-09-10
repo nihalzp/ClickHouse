@@ -156,7 +156,18 @@ private:
     /// on `many_data`. Held by pointer: the producer's definition stays out of this widely
     /// included header (see `AdaptiveAggregationImpl.h`).
     std::unique_ptr<AdaptiveAggregationProducer> adaptive_context;
+    /// Owns the outbox and the input storage retained while aggregation waits for admission.
     std::unique_ptr<AdaptiveAggregationExecution> adaptive_execution;
+    size_t next_ready_chunk = 0;
+
+    /// Final conversion starts after the last buffered chunks have been admitted.
+    enum class AdaptiveFinishStage
+    {
+        NotStarted,
+        AfterFinalFlush,
+        Complete,
+    };
+    AdaptiveFinishStage adaptive_finish_stage = AdaptiveFinishStage::NotStarted;
 
     size_t max_threads = 1;
     size_t temporary_data_merge_threads = 1;

@@ -5,41 +5,33 @@
 namespace DB
 {
 
-/// Storage owned by an aggregating processor while prepared chunks cross its admission port.
-/// The input owners survive post-block checks, but no thread-local tracker or hashing state
-/// survives a scheduler yield.
+/// Keeps a block's columns and instructions alive while its staged chunks await admission.
+/// The processor transports the outbox and resumes pending checks; only `Aggregator` reads
+/// or changes the suspended block state.
 struct AdaptiveAggregationExecution
 {
     explicit AdaptiveAggregationExecution(AdaptiveAggregationProducer & producer_) : producer(producer_)
     {
     }
 
-    /// The producer outlives its execution storage, including cancellation cleanup.
-    AdaptiveAggregationProducer & producer;
+    /// Reports whether admission must be followed by `Aggregator::resumeAdaptiveBlock`.
+    bool hasPendingBlock() const { return next_step != Aggregator::PostBlockStep::None; }
 
-    enum class Continuation
-    {
-        None,
-        BeforeMemoryCheck,
-        FrozenPressureDrain,
-        BaselinePressureDrain,
-    };
-
-    enum class Finish
-    {
-        NotStarted,
-        AfterFinalFlush,
-        Complete,
-    };
-
+    /// Prepared chunks awaiting transport and the allocation context to use for their admission.
     std::vector<StagedChunkPtr> ready_chunks;
-    size_t next_chunk = 0;
-    Continuation continuation = Continuation::None;
-    Finish finish = Finish::NotStarted;
     bool use_own_memory_tracker = false;
+
+private:
+    friend class Aggregator;
+
+    /// The producer outlives its suspended execution state, including cancellation cleanup.
+    AdaptiveAggregationProducer & producer;
+    Aggregator::PostBlockStep next_step = Aggregator::PostBlockStep::None;
     size_t input_rows = 0;
     Aggregator::PostBlockSnapshot snapshot;
 
+    /// These owners remain alive until all post-block checks finish. The resume method releases
+    /// prepared storage under the aggregation tracker and input columns under the caller's tracker.
     Columns columns;
     Columns materialized_columns;
     Aggregator::NestedColumnsHolder nested_columns_holder;

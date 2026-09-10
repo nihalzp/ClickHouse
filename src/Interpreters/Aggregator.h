@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <type_traits>
 
 #include <AggregateFunctions/IAggregateFunction_fwd.h>
@@ -271,9 +272,10 @@ public:
 
     const Params & getParams() const { return params; }
 
-    /// Process one block. Return false if the processing should be aborted (with group_by_overflow_mode = 'break').
-    /// `execution` binds adaptive execution storage to its producer, or is null for ordinary aggregation.
-    /// A nonempty continuation suspends post-block checks until ready chunks have been admitted.
+    /// Processes one block and returns false when `group_by_overflow_mode = 'break'` stops consumption.
+    /// `execution` is null for ordinary aggregation. Adaptive execution can leave prepared chunks in
+    /// `ready_chunks`; the caller admits them and calls `resumeAdaptiveBlock` while `hasPendingBlock`
+    /// is true, before consuming another block or finishing the producer.
     bool executeOnBlock(Columns columns,
         size_t row_begin, size_t row_end,
         AggregatedDataVariants & result,
@@ -281,26 +283,6 @@ public:
         AggregateColumns & aggregate_columns, /// Passed to not create them anew for each block
         bool & no_more_keys,
         AdaptiveAggregationExecution * execution) const;
-
-    /// One claimed batch of staged chunks into one drain table, bucket-major: bucket b's
-    /// slices from all of the batch's chunks drain consecutively, so the destination subtable
-    /// and its arena stay cache-hot across the whole batch instead of being revisited once per
-    /// chunk - the measured win of the pressure drains. The price is that the batch stays
-    /// alive until the pass ends: the callers bound a batch at about one spill floor of
-    /// records and release the chunks right after the call. Stops between buckets when
-    /// cancelled.
-    size_t drainStagedBatch(
-        AggregatedDataVariants & table,
-        const std::vector<StagedChunkPtr> & chunks,
-        std::atomic<bool> & is_cancelled,
-        PaddedPODArray<AggregateDataPtr> & places_scratch) const;
-
-    /// A fresh drain destination of the session's method type, with one arena per bucket.
-    AggregatedDataVariantsPtr createAdaptiveDrainTable(AggregatedDataVariants::Type type) const;
-
-    /// Writes a detached drain table through the ordinary external machinery and tears it
-    /// down; skipped for a cancelled query, whose table just destroys itself.
-    void spillDetachedAdaptiveTable(AdaptiveAggregationSession & shared, AggregatedDataVariants & table) const;
 
     /// Retires a merged-and-converted bucket's working memory, called by the bucket's merge
     /// task after a successful conversion (the output either copied the values out or captured
@@ -323,15 +305,16 @@ public:
         AdaptiveAggregationSession & shared,
         std::atomic<bool> & is_cancelled) const;
 
-    /// Seals buffered candidates and appends prepared pieces to the producer's outbox. The
-    /// producer waits for admission before resuming pressure work or finishing its stream.
+    /// Coalesces buffered chunks, splits them at the pressure bound, and appends prepared pieces
+    /// to the execution outbox for admission.
     void flushPendingChunks(AdaptiveAggregationExecution & execution) const;
 
     /// Resumes the post-block checks after the producer's admission port acknowledges publication.
     bool resumeAdaptiveBlock(
         AdaptiveAggregationExecution & execution, AggregatedDataVariants & result, bool & no_more_keys) const;
 
-    /// Registers an immutable chunk in the allocation context of its producer's publication point.
+    /// Publishes a prepared chunk to the session backlog. Uses the aggregation tracker when
+    /// `use_own_memory_tracker` records that context for the producer's publication.
     void admitStagedChunk(
         AdaptiveAggregationSession & shared, const StagedChunkPtr & chunk, bool use_own_memory_tracker) const;
 
@@ -345,68 +328,10 @@ public:
     /// it found nothing to claim: the trigger is reached by every producer on every block.
     size_t drainStagedChunksUnderMemoryPressure(AdaptiveAggregationSession & shared) const;
 
-    /// One claim of the sweep: a full batch drained into a producer-local table and written,
-    /// after which it returns true so the sweep claims again; or the tail drained into the
-    /// shared table, nothing to claim, the query under the threshold, or a declined
-    /// reservation, after which it returns false and the sweep ends. `drained_records_out`
-    /// reports what this claim drained, which the two endings that drain nothing leave at zero.
-    bool drainStagedChunksBatchUnderMemoryPressure(
-        AdaptiveAggregationSession & shared,
-        PaddedPODArray<AggregateDataPtr> & places_scratch,
-        size_t & drained_records_out) const;
-
     /// The finish drain: converts everything still enqueued into disk-mergeable form when the
     /// merge goes external, spilling at the part bound as it goes, and throws if anything
     /// would be left behind.
     void drainStagedChunksAtFinish(AdaptiveAggregationSession & shared) const;
-
-    /// How large a pressure-drained part may grow, how many records fill one on the states
-    /// alone, and how many detached bytes may be in flight to the writer at once. The sweeps
-    /// are the valve that holds the query under `max_bytes_before_external_group_by`, so their
-    /// own working set - the batch a sweep claims, the table it drains that batch into, the
-    /// residue the tails share and the writes in flight - is sized from that threshold instead
-    /// of from an absolute constant, or the valve costs more memory than it sheds. Without a
-    /// threshold to size against, the part bound is unlimited and the absolute ceilings stand.
-    /// The per-record charge is read from the drain table's variant, because the hash cell
-    /// of a `keys128` or `keys256` table is not that of a `UInt64` or a string key.
-    size_t adaptivePressurePartBytes() const;
-    size_t adaptiveDrainRecordBytes(AggregatedDataVariants::Type type) const;
-    size_t adaptivePressurePartRecords(AggregatedDataVariants::Type type) const;
-    size_t adaptivePressureDetachedBytesBudget() const;
-
-    /// The bytes a claimed batch is expected to occupy once drained into a table of the given
-    /// variant: the per-record cells and aggregate states of the destination table, plus the
-    /// batch's own staged bytes, which stay resident beside that table until the drain
-    /// returns. Saturating, because an absurd product only means "ask for the whole budget".
-    size_t estimateAdaptiveDrainBytes(AggregatedDataVariants::Type type, size_t records, size_t staged_bytes) const;
-
-    /// One claim of a drain, from the chunks in order starting at `begin`: the batch takes the
-    /// next chunk while the batch with it stays under both targets, and is closed before the
-    /// chunk that would take it to either, which is left for the next claim, so the table a
-    /// drain builds stays under the bound the targets were sized to. Only a first chunk that is
-    /// over a target alone is taken regardless, because a chunk is claimed whole. A claim that
-    /// reached a target, or was closed before the chunk that would have reached it, is full - a
-    /// part of its own; one that ran out of chunks is the tail.
-    struct StagedChunkClaim
-    {
-        /// One past the last chunk claimed.
-        size_t end = 0;
-        size_t records = 0;
-        size_t staged_bytes = 0;
-        bool full = false;
-    };
-    StagedChunkClaim claimStagedChunksToBound(
-        const std::vector<StagedChunkPtr> & chunks,
-        size_t begin,
-        AggregatedDataVariants::Type type,
-        size_t records_target,
-        size_t bytes_target) const;
-
-    /// For a producer back on the baseline path, which cannot free the shared drain table by
-    /// flushing its own: writes that table out regardless of the part floor, then returns query
-    /// memory sampled with none of it resident and no detached table in flight. Empty when no
-    /// producer ever froze, so there is no shared table, or when the query was cancelled.
-    std::optional<Int64> releaseAdaptiveDrainResidue(AdaptiveAggregationSession & shared) const;
 
     /** This array serves two purposes.
       *
@@ -471,13 +396,13 @@ public:
       */
     AggregatedChunks convertToChunks(AggregatedDataVariants & data_variants, bool final) const;
 
-    /// `adaptive_session` (or nullptr when the adaptive aggregation is off) feeds the
-    /// thaw verdict into the hash-table statistics next to the observed sizes.
     /// Records the thaw verdict in the hash-table statistics when the session measured one.
     /// The in-memory merge records it inside `prepareVariantsToMerge`; the external merge never
     /// reaches that, so the finish path calls this instead.
     void recordAdaptiveStagingVerdict(AdaptiveAggregationSession & shared) const;
 
+    /// Prepares the variants and records their sizes. An adaptive session also contributes its
+    /// measured thaw verdict to the hash-table statistics.
     ManyAggregatedDataVariants prepareVariantsToMerge(
         ManyAggregatedDataVariants && data_variants, AdaptiveAggregationSession * adaptive_session) const;
 
@@ -746,6 +671,84 @@ private:
         size_t row_end,
         bool all_keys_are_const) const;
 
+    /// One claimed batch of staged chunks into one drain table, bucket-major: bucket b's
+    /// slices from all of the batch's chunks drain consecutively, so the destination subtable
+    /// and its arena stay cache-hot across the whole batch instead of being revisited once per
+    /// chunk - the measured win of the pressure drains. The price is that the batch stays
+    /// alive until the pass ends: the callers bound a batch at about one spill floor of
+    /// records and release the chunks right after the call. Stops between buckets when
+    /// cancelled.
+    size_t drainStagedBatch(
+        AggregatedDataVariants & table,
+        const std::vector<StagedChunkPtr> & chunks,
+        std::atomic<bool> & is_cancelled,
+        PaddedPODArray<AggregateDataPtr> & places_scratch) const;
+
+    /// A fresh drain destination of the session's method type, with one arena per bucket.
+    AggregatedDataVariantsPtr createAdaptiveDrainTable(AggregatedDataVariants::Type type) const;
+
+    /// Writes a detached drain table through the ordinary external machinery and tears it
+    /// down; skipped for a cancelled query, whose table just destroys itself.
+    void spillDetachedAdaptiveTable(AdaptiveAggregationSession & shared, AggregatedDataVariants & table) const;
+
+    /// One claim of the sweep: a full batch drained into a producer-local table and written,
+    /// after which it returns true so the sweep claims again; or the tail drained into the
+    /// shared table, nothing to claim, the query under the threshold, or a declined
+    /// reservation, after which it returns false and the sweep ends. `drained_records_out`
+    /// reports what this claim drained, which the two endings that drain nothing leave at zero.
+    bool drainStagedChunksBatchUnderMemoryPressure(
+        AdaptiveAggregationSession & shared,
+        PaddedPODArray<AggregateDataPtr> & places_scratch,
+        size_t & drained_records_out) const;
+
+    /// How large a pressure-drained part may grow, how many records fill one on the states
+    /// alone, and how many detached bytes may be in flight to the writer at once. The sweeps
+    /// are the valve that holds the query under `max_bytes_before_external_group_by`, so their
+    /// own working set - the batch a sweep claims, the table it drains that batch into, the
+    /// residue the tails share and the writes in flight - is sized from that threshold instead
+    /// of from an absolute constant, or the valve costs more memory than it sheds. Without a
+    /// threshold to size against, the part bound is unlimited and the absolute ceilings stand.
+    /// The per-record charge is read from the drain table's variant, because the hash cell
+    /// of a `keys128` or `keys256` table is not that of a `UInt64` or a string key.
+    size_t adaptivePressurePartBytes() const;
+    size_t adaptiveDrainRecordBytes(AggregatedDataVariants::Type type) const;
+    size_t adaptivePressurePartRecords(AggregatedDataVariants::Type type) const;
+    size_t adaptivePressureDetachedBytesBudget() const;
+
+    /// The bytes a claimed batch is expected to occupy once drained into a table of the given
+    /// variant: the per-record cells and aggregate states of the destination table, plus the
+    /// batch's own staged bytes, which stay resident beside that table until the drain
+    /// returns. Saturating, because an absurd product only means "ask for the whole budget".
+    size_t estimateAdaptiveDrainBytes(AggregatedDataVariants::Type type, size_t records, size_t staged_bytes) const;
+
+    /// One claim of a drain, from the chunks in order starting at `begin`: the batch takes the
+    /// next chunk while the batch with it stays under both targets, and is closed before the
+    /// chunk that would take it to either, which is left for the next claim, so the table a
+    /// drain builds stays under the bound the targets were sized to. Only a first chunk that is
+    /// over a target alone is taken regardless, because a chunk is claimed whole. A claim that
+    /// reached a target, or was closed before the chunk that would have reached it, is full - a
+    /// part of its own; one that ran out of chunks is the tail.
+    struct StagedChunkClaim
+    {
+        /// One past the last chunk claimed.
+        size_t end = 0;
+        size_t records = 0;
+        size_t staged_bytes = 0;
+        bool full = false;
+    };
+    StagedChunkClaim claimStagedChunksToBound(
+        const std::vector<StagedChunkPtr> & chunks,
+        size_t begin,
+        AggregatedDataVariants::Type type,
+        size_t records_target,
+        size_t bytes_target) const;
+
+    /// For a producer back on the baseline path, which cannot free the shared drain table by
+    /// flushing its own: writes that table out regardless of the part floor, then returns query
+    /// memory sampled with none of it resident and no detached table in flight. Empty when no
+    /// producer ever froze, so there is no shared table, or when the query was cancelled.
+    std::optional<Int64> releaseAdaptiveDrainResidue(AdaptiveAggregationSession & shared) const;
+
     void initAdaptiveSession(AggregatedDataVariants & local_result, AdaptiveAggregationSession & shared) const;
 
     /// The freeze transition: initializes the session once, flips the producer's phase, and
@@ -753,9 +756,8 @@ private:
     /// perform the identical transition.
     void freezeAdaptive(AggregatedDataVariants & result, AdaptiveAggregationProducer & adaptive) const;
 
-    /// The frozen consume path: rows whose key the local table holds are aggregated in place,
-    /// the other rows are staged per bucket and published to the shared backlogs for the
-    /// merge-time drain.
+    /// Aggregates frozen-table hits in place and converts misses into chunks grouped by bucket.
+    /// Ready chunks are appended to `ready_chunks` for the processor to send through admission.
     void executeFrozen(
         const Columns & columns,
         size_t row_begin,
@@ -799,10 +801,8 @@ private:
         std::vector<StagedChunkPtr> & ready_chunks,
         bool all_keys_are_const) const;
 
-    /// Groups the current block's staged misses by bucket (counting sort) into one staged chunk
-    /// and hands it to the converter's coalescing buffer. Key bytes are copied directly from the
-    /// hashing state's key holder into their bucket position. General aggregate payloads also
-    /// gather argument values into dense columns in the same order.
+    /// Converts recorded misses, observes their pre-deduplication sample, then clears the recording
+    /// buffers. The converter coalesces the candidate, and any ready chunk is prepared for admission.
     template <typename SharedKey, typename State>
     void stageDelayedRecords(
         const Columns & columns,
@@ -814,8 +814,18 @@ private:
         bool counts_only,
         std::optional<UInt32> key_row_override = std::nullopt) const;
 
-    /// Readings taken after staged admission and retained through any pressure flush. The group
-    /// count is cached to avoid recounting a two-level table when execution resumes.
+    /// Identifies the next post-block operation. Pressure steps retain the memory readings
+    /// taken before flushing buffered chunks, so admission cannot change the block's decisions.
+    enum class PostBlockStep
+    {
+        None,
+        MemoryCheck,
+        FrozenPressureDrain,
+        BaselinePressureDrain,
+    };
+
+    /// Group count and memory readings shared by all decisions for one block, including checks
+    /// resumed after a pressure flush. The first reading follows admission of the block's ready chunks.
     struct PostBlockSnapshot
     {
         size_t groups = 0;
@@ -823,19 +833,24 @@ private:
         Int64 aggregation_bytes = 0;
     };
 
+    /// Reads group count and both memory accounts before making the block's pressure decisions.
     PostBlockSnapshot getPostBlockSnapshot(const AggregatedDataVariants & result, bool use_own_memory_tracker) const;
 
-    bool finishOnBlock(
-        AggregatedDataVariants & result, bool & no_more_keys,
+    /// Runs synchronous or resumed post-block checks until completion or a request for admission.
+    bool runPostBlockChecks(
+        PostBlockStep step, AggregatedDataVariants & result, bool & no_more_keys,
         const PostBlockSnapshot & snapshot, AdaptiveAggregationExecution * execution) const;
 
+    /// Applies ordinary two-level conversion, group limits, and spilling using the saved readings.
     bool finishBaselineBlock(
         AggregatedDataVariants & result, bool & no_more_keys,
         const PostBlockSnapshot & snapshot, AdaptiveAggregationProducer * adaptive) const;
 
-    /// Observes pre-deduplication records using the existing session-wide thaw sample.
+    /// Updates the session-wide thaw sample from pre-deduplication hashes. `batch_bytes` includes
+    /// staged keys, routing metadata, multiplicities, and variable-width argument values for those
+    /// records; fixed-width arguments are excluded because staging does not multiply their execution cost.
     void observeAdaptiveStagedRecords(
-        AdaptiveAggregationSession & shared, const PaddedPODArray<UInt64> & hashes, size_t batch_bytes) const;
+        AdaptiveAggregationSession & shared, std::span<const UInt64> hashes, size_t batch_bytes) const;
 
     /// Checks candidate invariants, splits at the pressure part bound, and prepares immutable
     /// pieces for transport. Shared backlog registration belongs to the admission transform.
@@ -1247,9 +1262,9 @@ private:
         NestedColumnsHolder & nested_columns_holder) const;
 
     /// The instruction-building tail of `prepareAggregateInstructions`: the combinator
-    /// unwrapping (-State, -Array) and the batch wiring for one aggregate whose argument
-    /// pointers are already in place. Called directly for staged chunks, whose payload
-    /// columns the seal already normalized to the drain's form.
+    /// unwrapping (`-State`, `-Array`) and the batch wiring for one aggregate whose argument
+    /// pointers are already in place. Staged chunks call this directly after conversion has
+    /// normalized their argument columns to the drain's form.
     void buildAggregateFunctionInstruction(
         size_t i,
         bool has_sparse_arguments,
