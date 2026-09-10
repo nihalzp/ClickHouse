@@ -130,22 +130,24 @@ namespace
     class SourceFromNativeStream final : public ISource
     {
     public:
-        explicit SourceFromNativeStream(SharedHeader header, TemporaryBlockStreamReaderHolder tmp_stream_)
-            : ISource(header)
-            , tmp_stream(std::move(tmp_stream_))
-        {}
+        SourceFromNativeStream(SharedHeader header, TemporaryBlockStreamHolder file_holder_)
+            : ISource(std::move(header))
+            , file_holder(std::move(file_holder_))
+            , reader(file_holder.getReadStream())
+        {
+        }
 
         String getName() const override { return "SourceFromNativeStream"; }
 
         Chunk generate() override
         {
-            if (!tmp_stream)
+            if (!reader)
                 return {};
 
-            auto block = tmp_stream->read();
+            auto block = reader->read();
             if (block.empty())
             {
-                tmp_stream.reset();
+                reader.reset();
                 return {};
             }
             return convertToChunk(block);
@@ -154,7 +156,9 @@ namespace
         std::optional<ReadProgress> getReadProgress() override { return std::nullopt; }
 
     private:
-        TemporaryBlockStreamReaderHolder tmp_stream;
+        /// The file outlives its reader and remains owned until this source is destroyed.
+        TemporaryBlockStreamHolder file_holder;
+        TemporaryBlockStreamReaderHolder reader;
     };
 }
 
@@ -1129,7 +1133,7 @@ AggregatingTransform::AggregatingTransform(
     if (many_data->adaptive_session && params->aggregator.getParams().enable_adaptive_aggregator)
     {
         adaptive_context = std::make_unique<AdaptiveAggregationProducer>(many_data->adaptive_session);
-        adaptive_execution = std::make_unique<AdaptiveAggregationExecution>();
+        adaptive_execution = std::make_unique<AdaptiveAggregationExecution>(*adaptive_context);
     }
 }
 
@@ -1302,7 +1306,7 @@ void AggregatingTransform::work()
 {
     if (adaptive_execution && adaptive_execution->continuation != AdaptiveAggregationExecution::Continuation::None)
     {
-        if (!params->aggregator.resumeAdaptiveBlock(*adaptive_context, *adaptive_execution, variants, no_more_keys))
+        if (!params->aggregator.resumeAdaptiveBlock(*adaptive_execution, variants, no_more_keys))
             is_consume_finished = true;
     }
     else if (adaptive_context && is_consume_finished)
@@ -1367,7 +1371,6 @@ void AggregatingTransform::consume(Chunk chunk)
                 key_columns,
                 aggregate_columns,
                 no_more_keys,
-                adaptive_context.get(),
                 adaptive_execution.get()))
             is_consume_finished = true;
     }
@@ -1384,7 +1387,7 @@ void AggregatingTransform::finishLocalAggregation()
         else
             params->aggregator.executeOnBlock(
                 getInputs().front().getHeader().getColumns(), 0, 0, variants, key_columns, aggregate_columns, no_more_keys,
-                /* adaptive= */ nullptr);
+                /*execution=*/nullptr);
     }
 
     double elapsed_seconds = watch.elapsedSeconds();
@@ -1423,7 +1426,7 @@ void AggregatingTransform::initGenerate()
 
     processors = createAggregationMergePipeline(
         params, many_data, max_threads, temporary_data_merge_threads,
-        should_produce_results_in_order_of_bucket_number, skip_merging, updater, tmp_files);
+        should_produce_results_in_order_of_bucket_number, skip_merging, updater);
 }
 
 void AggregatingTransform::finishAdaptiveAggregation()
@@ -1435,7 +1438,7 @@ void AggregatingTransform::finishAdaptiveAggregation()
         /// Final flushing has the transform's query tracker, matching the local finish path.
         execution.use_own_memory_tracker = false;
         if (adaptive_context->session->initialized.load(std::memory_order_acquire))
-            params->aggregator.flushPendingChunks(*adaptive_context, execution.ready_chunks);
+            params->aggregator.flushPendingChunks(execution);
         execution.finish = AdaptiveAggregationExecution::Finish::AfterFinalFlush;
         if (!execution.ready_chunks.empty())
             return;
@@ -1451,7 +1454,7 @@ Processors createAggregationMergePipeline(
     const AggregatingTransformParamsPtr & params, const ManyAggregatedDataPtr & many_data,
     size_t max_threads, size_t temporary_data_merge_threads,
     bool should_produce_results_in_order_of_bucket_number, bool skip_merging,
-    const RuntimeDataflowStatisticsCacheUpdaterPtr & updater, std::list<TemporaryBlockStreamHolder> & tmp_files)
+    const RuntimeDataflowStatisticsCacheUpdaterPtr & updater)
 {
     Processors processors;
     static const auto log = getLogger("AggregatingTransform");
@@ -1603,10 +1606,9 @@ Processors createAggregationMergePipeline(
                 auto stat = tmp_stream.finishWriting();
                 compressed_size += stat.compressed_size;
                 uncompressed_size += stat.uncompressed_size;
-                pipes.emplace_back(Pipe(std::make_unique<SourceFromNativeStream>(std::make_shared<const Block>(tmp_stream.getHeader()), tmp_stream.getReadStream())));
+                auto header = std::make_shared<const Block>(tmp_stream.getHeader());
+                pipes.emplace_back(Pipe(std::make_unique<SourceFromNativeStream>(std::move(header), std::move(tmp_stream))));
             }
-
-            tmp_files.splice(tmp_files.end(), new_tmp_files);
         }
 
         LOG_DEBUG(

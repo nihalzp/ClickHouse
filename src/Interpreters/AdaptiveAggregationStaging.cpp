@@ -1,4 +1,5 @@
-#include <Interpreters/AdaptiveAggregationImpl.h>
+#include <algorithm>
+
 #include <Interpreters/AdaptiveAggregationStagingImpl.h>
 #include <Processors/Merges/Algorithms/PartitionedChunkCoalescing.h>
 #include <Common/logger_useful.h>
@@ -12,10 +13,81 @@ namespace ProfileEvents
 namespace DB
 {
 
-bool StagedChunk::wellFormed() const
+size_t StagedChunk::byteSize() const
+{
+    size_t bytes = keys.key_bytes.size() + keys.key_offsets.size() * sizeof(UInt64) + keys.routing_hashes.size() * sizeof(UInt64);
+    if (const auto * counts = std::get_if<CountPayload>(&payload))
+        bytes += counts->multiplicities.size() * sizeof(UInt32);
+    else
+        for (const auto & column : std::get<AggregatePayload>(payload).argument_columns)
+            if (column)
+                bytes += column->byteSize();
+    return bytes;
+}
+
+size_t StagedChunk::allocatedBytes() const
+{
+    size_t bytes = keys.key_bytes.allocated_bytes() + keys.key_offsets.allocated_bytes() + keys.routing_hashes.allocated_bytes();
+    if (const auto * counts = std::get_if<CountPayload>(&payload))
+        bytes += counts->multiplicities.allocated_bytes();
+    else
+        for (const auto & column : std::get<AggregatePayload>(payload).argument_columns)
+            if (column)
+                bytes += column->allocatedBytes();
+    return bytes;
+}
+
+MutableStagedChunkPtr StagedChunk::cut(size_t start, size_t length) const
+{
+    chassert(start <= keys.size() && length <= keys.size() - start);
+    const auto & source_keys = keys;
+    const size_t end = start + length;
+
+    /// Slices have their final size. Exact reservations avoid growth headroom that would
+    /// inflate their allocation-based pressure estimates beyond the chosen range size.
+    auto piece = std::make_shared<StagedChunk>();
+    auto & result_keys = piece->keys;
+    result_keys.fixed_key_size = source_keys.fixed_key_size;
+    result_keys.routing_hashes.reserve_exact(length);
+    result_keys.routing_hashes.insert(source_keys.routing_hashes.begin() + start, source_keys.routing_hashes.begin() + end);
+
+    const size_t byte_begin = source_keys.keyByteOffsetAt(start);
+    const size_t byte_end = source_keys.keyByteOffsetAt(end);
+    result_keys.key_bytes.reserve_exact(byte_end - byte_begin);
+    result_keys.key_bytes.insert(source_keys.key_bytes.begin() + byte_begin, source_keys.key_bytes.begin() + byte_end);
+    if (!source_keys.fixed_key_size)
+    {
+        result_keys.key_offsets.reserve_exact(length + 1);
+        for (size_t i = start; i <= end; ++i)
+            result_keys.key_offsets.push_back(source_keys.key_offsets[i] - byte_begin);
+    }
+
+    /// Clamping preserves intersections with each bucket, including cuts inside a bucket.
+    for (size_t b = 0; b <= ADAPTIVE_AGGREGATION_NUM_BUCKETS; ++b)
+        result_keys.bucket_offsets[b] = static_cast<UInt32>(std::clamp<size_t>(source_keys.bucket_offsets[b], start, end) - start);
+
+    if (const auto * counts = std::get_if<CountPayload>(&payload))
+    {
+        auto & multiplicities = piece->payload.emplace<CountPayload>().multiplicities;
+        multiplicities.reserve_exact(length);
+        multiplicities.insert(counts->multiplicities.begin() + start, counts->multiplicities.begin() + end);
+    }
+    else
+    {
+        const auto & columns = std::get<AggregatePayload>(payload).argument_columns;
+        auto & argument_columns = piece->payload.emplace<AggregatePayload>().argument_columns;
+        argument_columns.reserve(columns.size());
+        for (const auto & column : columns)
+            argument_columns.push_back(column ? column->cut(start, length) : nullptr);
+    }
+    return piece;
+}
+
+bool StagedChunk::isWellFormed() const
 {
     const size_t records = keys.size();
-    if (keys.bucket_offsets.back() != records)
+    if (keys.bucket_offsets.front() != 0 || keys.bucket_offsets.back() != records
+        || !std::is_sorted(keys.bucket_offsets.begin(), keys.bucket_offsets.end()))
         return false;
     if (keys.fixed_key_size)
     {
@@ -24,15 +96,11 @@ bool StagedChunk::wellFormed() const
     }
     else
     {
-        if (keys.key_offsets.size() != records + 1 || keys.key_offsets.back() != keys.key_bytes.size())
+        if (keys.key_offsets.size() != records + 1 || keys.key_offsets.front() != 0
+            || keys.key_offsets.back() != keys.key_bytes.size()
+            || !std::is_sorted(keys.key_offsets.begin(), keys.key_offsets.end()))
             return false;
-        for (size_t i = 0; i < records; ++i)
-            if (keys.key_offsets[i] > keys.key_offsets[i + 1])
-                return false;
     }
-    for (size_t b = 0; b < ADAPTIVE_AGGREGATION_NUM_BUCKETS; ++b)
-        if (keys.bucket_offsets[b] > keys.bucket_offsets[b + 1])
-            return false;
     if (const auto * counts = std::get_if<CountPayload>(&payload))
         return counts->multiplicities.size() == records;
     for (const auto & column : std::get<AggregatePayload>(payload).argument_columns)
@@ -40,12 +108,6 @@ bool StagedChunk::wellFormed() const
             return false;
     return true;
 }
-
-StagedChunk::AggregatePayload::AggregatePayload() = default;
-StagedChunk::AggregatePayload::AggregatePayload(AggregatePayload &&) noexcept = default;
-StagedChunk::AggregatePayload & StagedChunk::AggregatePayload::operator=(AggregatePayload &&) noexcept
-    = default;
-StagedChunk::AggregatePayload::~AggregatePayload() = default;
 
 void StagedChunkConverter::clearMisses()
 {
@@ -77,10 +139,7 @@ void concatenateStagedKeys(StagedChunk::StagedKeys & keys, const std::vector<Mut
     {
         keys.bucket_offsets[b] = static_cast<UInt32>(total);
         for (const auto & mini : minis)
-        {
-            chassert(mini->countsOnly() == minis.front()->countsOnly());
             total += mini->keys.recordsForBucket(b);
-        }
     }
     keys.bucket_offsets[num_buckets] = static_cast<UInt32>(total);
 
@@ -120,10 +179,9 @@ void concatenateStagedKeys(StagedChunk::StagedKeys & keys, const std::vector<Mut
     }
 }
 
-/// The bypassed count seal: a straight concatenation with no cross-mini dedup. Duplicate count
-/// records are legal - the drain merges them at its emplace - so a stale bypass costs staged
-/// memory until the next resample, never results.
-void sealValueStagedChunkConcatenated(const std::vector<MutableStagedChunkPtr> & minis, StagedChunk & chunk)
+/// Concatenates count payloads while coalescing deduplication is bypassed. Duplicate records
+/// retain their multiplicities and are combined when their keys are emplaced during draining.
+void concatenateCountChunks(const std::vector<MutableStagedChunkPtr> & minis, StagedChunk & chunk)
 {
     concatenateStagedKeys(chunk.keys, minis);
 
@@ -140,34 +198,28 @@ void sealValueStagedChunkConcatenated(const std::vector<MutableStagedChunkPtr> &
 
 }
 
-MutableStagedChunkPtr StagedChunkConverter::stage(
-    MutableStagedChunkPtr block, size_t estimated_payload_bytes, const ColumnNumbersList & aggregates_positions)
+MutableStagedChunkPtr StagedChunkConverter::stage(MutableStagedChunkPtr chunk)
 {
+    const size_t chunk_bytes = chunk->byteSize();
     /// Coalescing pays in proportion to how many batches merge into one chunk. A batch of at
-    /// least half the seal target could only ever merge with one neighbor, gaining almost
-    /// nothing for a full extra copy of its data, so it is enqueued as-is.
-    if (estimated_payload_bytes * 2 >= adaptive_seal_target_bytes)
-    {
-        return block;
-    }
+    /// least half the coalescing target gains little from another full copy, so it is returned
+    /// directly for preparation and admission.
+    if (chunk_bytes * 2 >= adaptive_coalescing_target_bytes)
+        return chunk;
 
-    pending_chunks.push_back(std::move(block));
-    pending_staged_bytes += estimated_payload_bytes;
+    pending_chunks.push_back(std::move(chunk));
+    pending_staged_bytes += chunk_bytes;
 
-    if (pending_staged_bytes >= adaptive_seal_target_bytes)
-        return sealPendingChunks(aggregates_positions);
+    if (pending_staged_bytes >= adaptive_coalescing_target_bytes)
+        return flush();
     return {};
 }
 
-MutableStagedChunkPtr StagedChunkConverter::flush(const ColumnNumbersList & aggregates_positions)
+MutableStagedChunkPtr StagedChunkConverter::flush()
 {
-    if (!pending_chunks.empty())
-        return sealPendingChunks(aggregates_positions);
-    return {};
-}
+    if (pending_chunks.empty())
+        return {};
 
-MutableStagedChunkPtr StagedChunkConverter::sealPendingChunks(const ColumnNumbersList & aggregates_positions)
-{
     auto & minis = pending_chunks;
     const size_t num_minis = minis.size();
 
@@ -182,56 +234,57 @@ MutableStagedChunkPtr StagedChunkConverter::sealPendingChunks(const ColumnNumber
     auto chunk = std::make_shared<StagedChunk>();
     auto & keys = chunk->keys;
     const bool counts_only = minis.front()->countsOnly();
+    size_t input_records = 0;
+    for (const auto & mini : minis)
+    {
+        input_records += mini->keys.size();
+        chassert(mini->countsOnly() == counts_only);
+        chassert(mini->keys.fixed_key_size == minis.front()->keys.fixed_key_size);
+    }
 
     if (counts_only)
     {
-        /// The cross-mini dedup merges keys repeating across the buffered batches, which the
-        /// per-block publish dedup cannot see. On a distinct stream it merges nothing; the
-        /// productivity tracker then degrades the seal to a straight concatenation.
-        if (seal_dedup.shouldDedup())
+        /// Coalescing can merge keys repeated across candidates that per-block deduplication
+        /// cannot see. Unproductive passes eventually switch to direct concatenation.
+        if (coalescing_dedup.shouldDedup())
         {
-            size_t input_records = 0;
-            for (const auto & mini : minis)
-                input_records += mini->keys.size();
-            sealValueStagedChunkDeduplicated(minis, *chunk);
-            seal_dedup.record(input_records, chunk->keys.size());
+            coalesceCountChunksWithDeduplication(minis, *chunk);
+            coalescing_dedup.record(input_records, chunk->keys.size());
         }
         else
-            sealValueStagedChunkConcatenated(minis, *chunk);
+            concatenateCountChunks(minis, *chunk);
     }
     else
     {
         concatenateStagedKeys(keys, minis);
 
         auto columns_of = [](const StagedChunk & mini) -> const Columns &
-        { return std::get<StagedChunk::AggregatePayload>(mini.payload).argument_columns; };
+        {
+            return std::get<StagedChunk::AggregatePayload>(mini.payload).argument_columns;
+        };
 
         auto & argument_columns = chunk->payload.emplace<StagedChunk::AggregatePayload>().argument_columns;
-        argument_columns.assign(columns_of(*minis.front()).size(), nullptr);
-        for (const auto & argument_positions : aggregates_positions)
-            for (const auto position : argument_positions)
-            {
-                if (argument_columns[position])
-                    continue;
+        const auto & first_columns = columns_of(*minis.front());
+        argument_columns.assign(first_columns.size(), nullptr);
+        for (size_t position = 0; position < first_columns.size(); ++position)
+        {
+            if (!first_columns[position])
+                continue;
 
-                /// The seal normalized every batch's payload columns to the dense form the
-                /// drain consumes, so the buffered batches always agree at a position and the
-                /// coalescing is a plain concatenation.
-                VectorWithMemoryTracking<ColumnPtr> sources;
-                sources.reserve(num_minis);
-                for (const auto & mini : minis)
-                    sources.push_back(columns_of(*mini)[position]);
+            /// Conversion normalizes each candidate's argument columns, so candidates built
+            /// by this converter have matching representations at every populated position.
+            VectorWithMemoryTracking<ColumnPtr> sources;
+            sources.reserve(num_minis);
+            for (const auto & mini : minis)
+                sources.push_back(columns_of(*mini)[position]);
 
-                argument_columns[position] = coalescePartitionedColumn(
-                    sources, ADAPTIVE_AGGREGATION_NUM_BUCKETS, stagedOffsets(minis));
-            }
+            argument_columns[position] = coalescePartitionedColumn(
+                sources, ADAPTIVE_AGGREGATION_NUM_BUCKETS, stagedOffsets(minis));
+        }
     }
 
-    size_t batch_records = 0;
-    for (const auto & mini : minis)
-        batch_records += mini->keys.size();
     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSealedChunks);
-    ProfileEvents::increment(ProfileEvents::AdaptiveAggregationStagedRecordsMerged, batch_records - keys.size());
+    ProfileEvents::increment(ProfileEvents::AdaptiveAggregationStagedRecordsMerged, input_records - keys.size());
 
     static const auto log = getLogger("Aggregator");
     LOG_TRACE(
@@ -245,20 +298,21 @@ MutableStagedChunkPtr StagedChunkConverter::sealPendingChunks(const ColumnNumber
     return chunk;
 }
 
-void StagedChunkConverter::sealValueStagedChunkDeduplicated(
+void StagedChunkConverter::coalesceCountChunksWithDeduplication(
     const std::vector<MutableStagedChunkPtr> & minis,
     StagedChunk & chunk)
 {
     constexpr size_t num_buckets = ADAPTIVE_AGGREGATION_NUM_BUCKETS;
 
     auto multiplicities_of = [](const StagedChunk & mini) -> const PaddedPODArray<UInt32> &
-    { return std::get<StagedChunk::CountPayload>(mini.payload).multiplicities; };
+    {
+        return std::get<StagedChunk::CountPayload>(mini.payload).multiplicities;
+    };
 
     size_t total = 0;
     UInt64 total_key_bytes = 0;
     for (const auto & mini : minis)
     {
-        chassert(mini->countsOnly());
         total += mini->keys.size();
         total_key_bytes += mini->keys.key_bytes.size();
     }
@@ -272,10 +326,8 @@ void StagedChunkConverter::sealValueStagedChunkDeduplicated(
         keys.key_offsets.resize(total + 1);
     keys.key_bytes.resize(total_key_bytes);
 
-    /// The publish dedup only sees one block; keys repeating across the buffered batches are
-    /// merged here, while the seal copies the records anyway. Same scheme as the publish walk:
-    /// group a bucket's records by a few hash bits so a duplicate can only be one of its
-    /// group's survivors, then compare within the group.
+    /// Group each bucket's records by a few hash bits before comparing keys. Repeated keys
+    /// fall in the same group, so deduplication only scans that group's surviving records.
     struct StagedRef
     {
         UInt64 hash;
@@ -345,58 +397,6 @@ void StagedChunkConverter::sealValueStagedChunkDeduplicated(
     keys.routing_hashes.resize(out);
     multiplicities.resize(out);
     keys.key_bytes.resize(byte_pos);
-}
-
-/// The records [begin, end) of a chunk as a chunk of their own. The records are laid out bucket
-/// by bucket, so any record range is a contiguous slice of every staged array and the piece is a
-/// plain copy of that slice with the offsets rebased; the buckets outside the range come out
-/// empty, and a bucket the range starts or ends inside keeps the records that fell in it. The
-/// drains read a bucket's records from the piece's own offsets, so a bucket that spans two
-/// pieces is drained in two goes, into the same table if the same claim takes both pieces, and
-/// otherwise into two parts the external merge folds together.
-MutableStagedChunkPtr sliceStagedChunk(const StagedChunk & source, size_t begin, size_t end)
-{
-    const auto & src = source.keys;
-    const size_t records = end - begin;
-
-    /// Reserved exactly: the claim charges a chunk by its allocation (`estimateStagedBytesWithKeyCopy`), and
-    /// the pieces were sized by their bytes, so a power-of-two rounding of the arrays would make
-    /// a piece look up to twice its size to the claim and stop it a piece early.
-    auto piece = std::make_shared<StagedChunk>();
-    auto & keys = piece->keys;
-    keys.fixed_key_size = src.fixed_key_size;
-    keys.routing_hashes.reserve_exact(records);
-    keys.routing_hashes.insert(src.routing_hashes.begin() + begin, src.routing_hashes.begin() + end);
-
-    const size_t byte_begin = src.keyByteOffsetAt(begin);
-    const size_t byte_end = src.keyByteOffsetAt(end);
-    keys.key_bytes.reserve_exact(byte_end - byte_begin);
-    keys.key_bytes.insert(src.key_bytes.begin() + byte_begin, src.key_bytes.begin() + byte_end);
-    if (!src.fixed_key_size)
-    {
-        keys.key_offsets.reserve_exact(records + 1);
-        for (size_t i = begin; i <= end; ++i)
-            keys.key_offsets.push_back(src.key_offsets[i] - byte_begin);
-    }
-
-    for (size_t b = 0; b <= ADAPTIVE_AGGREGATION_NUM_BUCKETS; ++b)
-        keys.bucket_offsets[b] = static_cast<UInt32>(std::clamp<size_t>(src.bucket_offsets[b], begin, end) - begin);
-
-    if (const auto * counts = std::get_if<StagedChunk::CountPayload>(&source.payload))
-    {
-        auto & multiplicities = piece->payload.emplace<StagedChunk::CountPayload>().multiplicities;
-        multiplicities.reserve_exact(records);
-        multiplicities.insert(counts->multiplicities.begin() + begin, counts->multiplicities.begin() + end);
-    }
-    else
-    {
-        const auto & columns = std::get<StagedChunk::AggregatePayload>(source.payload).argument_columns;
-        auto & argument_columns = piece->payload.emplace<StagedChunk::AggregatePayload>().argument_columns;
-        argument_columns.reserve(columns.size());
-        for (const auto & column : columns)
-            argument_columns.push_back(column ? column->cut(begin, records) : nullptr);
-    }
-    return piece;
 }
 
 }

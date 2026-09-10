@@ -272,7 +272,7 @@ public:
     const Params & getParams() const { return params; }
 
     /// Process one block. Return false if the processing should be aborted (with group_by_overflow_mode = 'break').
-    /// Adaptive producers supply both their conversion context and processor-owned execution storage.
+    /// `execution` binds adaptive execution storage to its producer, or is null for ordinary aggregation.
     /// A nonempty continuation suspends post-block checks until ready chunks have been admitted.
     bool executeOnBlock(Columns columns,
         size_t row_begin, size_t row_end,
@@ -280,8 +280,7 @@ public:
         ColumnRawPtrs & key_columns,
         AggregateColumns & aggregate_columns, /// Passed to not create them anew for each block
         bool & no_more_keys,
-        AdaptiveAggregationProducer * adaptive,
-        AdaptiveAggregationExecution * execution = nullptr) const;
+        AdaptiveAggregationExecution * execution) const;
 
     /// One claimed batch of staged chunks into one drain table, bucket-major: bucket b's
     /// slices from all of the batch's chunks drain consecutively, so the destination subtable
@@ -326,12 +325,11 @@ public:
 
     /// Seals buffered candidates and appends prepared pieces to the producer's outbox. The
     /// producer waits for admission before resuming pressure work or finishing its stream.
-    void flushPendingChunks(AdaptiveAggregationProducer & adaptive, std::vector<StagedChunkPtr> & ready_chunks) const;
+    void flushPendingChunks(AdaptiveAggregationExecution & execution) const;
 
     /// Resumes the post-block checks after the producer's admission port acknowledges publication.
     bool resumeAdaptiveBlock(
-        AdaptiveAggregationProducer & adaptive, AdaptiveAggregationExecution & execution,
-        AggregatedDataVariants & result, bool & no_more_keys) const;
+        AdaptiveAggregationExecution & execution, AggregatedDataVariants & result, bool & no_more_keys) const;
 
     /// Registers an immutable chunk in the allocation context of its producer's publication point.
     void admitStagedChunk(
@@ -802,9 +800,9 @@ private:
         bool all_keys_are_const) const;
 
     /// Groups the current block's staged misses by bucket (counting sort) into one staged chunk
-    /// and hands it to the converter's coalescing buffer. Key bytes are copied exactly once, straight from
-    /// the hashing state's key holder into their bucket position; row-reference mode additionally
-    /// gathers the records' aggregate-argument values into dense compacted columns.
+    /// and hands it to the converter's coalescing buffer. Key bytes are copied directly from the
+    /// hashing state's key holder into their bucket position. General aggregate payloads also
+    /// gather argument values into dense columns in the same order.
     template <typename SharedKey, typename State>
     void stageDelayedRecords(
         const Columns & columns,
@@ -816,15 +814,24 @@ private:
         bool counts_only,
         std::optional<UInt32> key_row_override = std::nullopt) const;
 
+    /// Readings taken after staged admission and retained through any pressure flush. The group
+    /// count is cached to avoid recounting a two-level table when execution resumes.
+    struct PostBlockSnapshot
+    {
+        size_t groups = 0;
+        Int64 query_bytes = 0;
+        Int64 aggregation_bytes = 0;
+    };
+
+    PostBlockSnapshot getPostBlockSnapshot(const AggregatedDataVariants & result, bool use_own_memory_tracker) const;
+
     bool finishOnBlock(
-        AggregatedDataVariants & result, bool & no_more_keys, size_t input_rows,
-        size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
-        AdaptiveAggregationProducer * adaptive, AdaptiveAggregationExecution * execution) const;
+        AggregatedDataVariants & result, bool & no_more_keys,
+        const PostBlockSnapshot & snapshot, AdaptiveAggregationExecution * execution) const;
 
     bool finishBaselineBlock(
         AggregatedDataVariants & result, bool & no_more_keys,
-        size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
-        AdaptiveAggregationProducer * adaptive) const;
+        const PostBlockSnapshot & snapshot, AdaptiveAggregationProducer * adaptive) const;
 
     /// Observes pre-deduplication records using the existing session-wide thaw sample.
     void observeAdaptiveStagedRecords(
@@ -835,18 +842,15 @@ private:
     void prepareStagedChunks(
         const AdaptiveAggregationSession & shared, MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const;
 
-    /// Prepares one final payload in place and appends it as immutable to the producer's outbox.
-    void appendPreparedStagedChunk(MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const;
-
     /// Cuts a chunk whose drain is estimated over `adaptivePressurePartBytes` into pieces
     /// along bucket boundaries, each estimated within the bound where a single bucket allows;
     /// empty when the chunk fits as it is, so no copy is made in the common case.
     std::vector<MutableStagedChunkPtr> splitStagedChunkAtPartBound(
         const AdaptiveAggregationSession & shared, const StagedChunk & chunk) const;
 
-    /// Builds the staged chunk's shared preparation: the aggregate-function instructions over
-    /// its argument columns, in the chunk's own stable storage.
-    void prepareStagedChunk(StagedChunk & block) const;
+    /// Builds aggregate instructions in the chunk's stable storage and returns it as immutable
+    /// for admission. Count payloads require no instruction preparation.
+    StagedChunkPtr prepareStagedChunk(MutableStagedChunkPtr block) const;
 
     /// Drains one bucket's backlog into `method.data.impls[bucket_index]`. `key_storage`
     /// selects the ownership: merge-time drains emplace keys pointing into the retained

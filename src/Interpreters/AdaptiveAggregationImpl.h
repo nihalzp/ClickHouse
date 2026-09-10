@@ -272,7 +272,7 @@ struct AdaptiveAggregationSession
     std::once_flag init_flag;
     std::atomic<bool> initialized{false};
 
-    /// The thaw sampler (see the tuning constants in `Aggregator.cpp`). At publish the threads
+    /// The thaw sampler (see the tuning constants above). Before admission, the producers
     /// fold a sparse sample of their staged record hashes in here; repeats of a key collapse
     /// onto one entry across all threads, so sampled records per distinct sampled hash estimates
     /// the repeat factor of the staged stream as a whole, independently of how a key's
@@ -289,8 +289,6 @@ struct AdaptiveAggregationSession
     /// table at the next block and returns to the baseline path for good.
     std::atomic<bool> thaw_all{false};
 };
-
-using AdaptiveAggregationSessionPtr = std::shared_ptr<AdaptiveAggregationSession>;
 
 /// Per-transform context of the adaptive aggregation: the thread's lifecycle phase and its
 /// phase-owned counters, per-block staging for the missed rows (the arrays are cleared but

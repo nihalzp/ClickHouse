@@ -105,7 +105,7 @@ namespace
             memcpy(staged, key.bytes.data(), key.bytes.size());
     }
 
-    /// The count-record dedup primitive shared by the publish and seal walks. A duplicate key
+    /// The count-record deduplication primitive shared by chunk building and coalescing. A duplicate key
     /// can only be one of its group's survivors, the records staged in [group_begin, out) with
     /// the same few hash bits (usually zero or one): merge the run lengths instead of staging
     /// another copy of the key, with equal hashes of distinct keys split by the byte
@@ -178,7 +178,7 @@ void NO_INLINE StagedChunkConverter::buildDeduplicatedCountChunk(
     /// (~16 records per group), so the histogram stays cache-resident and small batches do not
     /// pay for counters they cannot fill. A bypassed pass (see `DedupProductivity`) degrades
     /// the grouping to plain buckets and the dedup scan below to a straight append.
-    const bool dedup = publish_dedup.shouldDedup();
+    const bool dedup = block_dedup.shouldDedup();
     const UInt32 sub_bits = dedup ? std::min<UInt32>(8, std::bit_width(total >> 12)) : 0;
     const size_t num_groups = num_buckets << sub_bits;
 
@@ -205,7 +205,7 @@ void NO_INLINE StagedChunkConverter::buildDeduplicatedCountChunk(
     for (size_t i = 0; i < total; ++i)
         grouped_indexes[cursor[group_of(i)]++] = static_cast<UInt32>(i);
 
-    /// Fixed-size keys stage no per-record size (see the kernels); the publish substitutes the
+    /// Fixed-size keys stage no per-record size (see the kernels); conversion substitutes the
     /// compile-time constant.
     UInt64 total_bytes = 0;
     if constexpr (adaptive_key_stages_bytes<SharedKey>)
@@ -279,7 +279,7 @@ void NO_INLINE StagedChunkConverter::buildDeduplicatedCountChunk(
     keys.key_bytes.resize(byte_pos);
 
     if (dedup)
-        publish_dedup.record(total, out);
+        block_dedup.record(total, out);
 }
 
 template <typename SharedKey, typename State>
@@ -287,7 +287,6 @@ void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
     StagedChunk & block,
     const Columns & columns,
     const ColumnNumbersList & aggregates_positions,
-    size_t aggregates_size,
     State & local_find_state,
     Arena & scratch_pool,
     std::optional<UInt32> key_row_override)
@@ -309,7 +308,7 @@ void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
     /// Counting sort of the staged misses by bucket: one pass over the records accumulates the
     /// record and key-byte histograms together, one pass over the buckets turns both into
     /// exclusive offsets.
-    /// Fixed-size keys stage no per-record size (see the kernels); the publish substitutes the
+    /// Fixed-size keys stage no per-record size (see the kernels); conversion substitutes the
     /// compile-time constant.
     const auto staged_key_size = [&](size_t record)
     {
@@ -350,7 +349,7 @@ void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
     /// the argument columns below. A zero-aggregate block stages keys only, so it needs none.
     ColumnUInt32::MutablePtr gather_indexes;
     UInt32 * gather_data = nullptr;
-    if (aggregates_size != 0)
+    if (!aggregates_positions.empty())
     {
         gather_indexes = ColumnUInt32::create();
         gather_indexes->getData().resize_exact(total);
@@ -375,10 +374,9 @@ void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
         /// The same byte extraction the count path uses: states that expose their padded
         /// column buffers hand the bytes out directly (in particular, the packed-string method
         /// does not rebuild the key, which would re-hash its content per record). The copy is
-        /// a plain bounded memcpy, NOT copyStagedKeyBytes: records scatter into bucket-grouped
-        /// positions, so an overflow-tolerant write would stomp neighbors that are already in
-        /// place. The guard also keeps the empty packed key's null data pointer away from
-        /// memcpy, which declares its sources nonnull.
+        /// a bounded `memcpy`: records scatter into bucket-grouped positions, so an
+        /// overflow-tolerant write could overwrite neighbors already in place. Empty packed
+        /// keys have a null data pointer, which `memcpy` does not accept.
         const size_t key_row = key_row_override ? *key_row_override : miss_source_rows[i];
         withStagedKeyBytes<SharedKey>(
             local_find_state,
@@ -404,7 +402,7 @@ void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
             /// then normalized to the dense form the drain consumes (the representation
             /// wrappers stripped recursively, then `LowCardinality`), so the chunk stores
             /// exactly what will be drained: the thaw estimate and the pinned memory
-            /// accounting measure the real payload, the publish-time preparation wires the
+            /// accounting measure the real payload, instruction preparation wires the
             /// columns directly instead of pinning a second, dense copy next to the wrapper,
             /// and a gathered `LowCardinality` no longer holds the source block's dictionary
             /// alive until the merge.
@@ -422,7 +420,6 @@ template <typename SharedKey, typename State>
 MutableStagedChunkPtr StagedChunkConverter::build(
     const Columns & columns,
     const ColumnNumbersList & aggregates_positions,
-    size_t aggregates_size,
     State & local_find_state,
     Arena & scratch_pool,
     bool counts_only,
@@ -433,7 +430,7 @@ MutableStagedChunkPtr StagedChunkConverter::build(
         buildDeduplicatedCountChunk<SharedKey>(*chunk, local_find_state, scratch_pool, key_row_override);
     else
         buildBucketGroupedAggregateChunk<SharedKey>(
-            *chunk, columns, aggregates_positions, aggregates_size, local_find_state, scratch_pool, key_row_override);
+            *chunk, columns, aggregates_positions, local_find_state, scratch_pool, key_row_override);
     return chunk;
 }
 

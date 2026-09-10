@@ -58,8 +58,8 @@ struct AdaptiveAggregationProducer;
 /// Producer-owned transport and suspended post-block work.
 struct AdaptiveAggregationExecution;
 
-/// All delayed records of one consumed block, grouped by bucket. A published chunk is
-/// immutable; only the producer building a chunk holds it mutably.
+/// Owned delayed records grouped by bucket. A chunk can combine records from multiple input
+/// blocks. A published chunk is immutable; only the producer building it holds it mutably.
 struct StagedChunk;
 using StagedChunkPtr = std::shared_ptr<const StagedChunk>;
 using MutableStagedChunkPtr = std::shared_ptr<StagedChunk>;

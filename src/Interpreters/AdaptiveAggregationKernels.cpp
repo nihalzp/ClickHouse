@@ -1,5 +1,5 @@
 /// The method-specialized frozen consume kernels and their staging orchestration. Conversion
-/// templates are defined in AdaptiveAggregationStagingImpl.h; bucket application and pressure
+/// templates are defined in `AdaptiveAggregationStagingImpl.h`; bucket application and pressure
 /// policy have separate translation units.
 
 #include <limits>
@@ -431,7 +431,7 @@ void NO_INLINE Aggregator::stageDelayedRecords(
     auto & shared = *adaptive.session;
 
     auto block = adaptive.converter.build<SharedKey>(
-        columns, aggregates_positions, params.aggregates_size, local_find_state, scratch_pool, counts_only, key_row_override);
+        columns, aggregates_positions, local_find_state, scratch_pool, counts_only, key_row_override);
     auto & keys = block->keys;
 
     size_t batch_bytes = 0;
@@ -457,16 +457,7 @@ void NO_INLINE Aggregator::stageDelayedRecords(
     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationStagedRecordsMerged, total - keys.size());
     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationStagedBytes, keys.key_bytes.size());
 
-    size_t estimated_payload_bytes
-        = keys.key_bytes.size() + keys.key_offsets.size() * sizeof(UInt64) + keys.routing_hashes.size() * sizeof(UInt64);
-    if (const auto * counts = std::get_if<StagedChunk::CountPayload>(&block->payload))
-        estimated_payload_bytes += counts->multiplicities.size() * sizeof(UInt32);
-    else
-        for (const auto & column : std::get<StagedChunk::AggregatePayload>(block->payload).argument_columns)
-            if (column)
-                estimated_payload_bytes += column->byteSize();
-
-    if (auto ready = adaptive.converter.stage(std::move(block), estimated_payload_bytes, aggregates_positions))
+    if (auto ready = adaptive.converter.stage(std::move(block)))
         prepareStagedChunks(*adaptive.session, std::move(ready), ready_chunks);
 }
 

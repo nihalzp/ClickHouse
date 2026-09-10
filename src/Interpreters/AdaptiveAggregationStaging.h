@@ -2,6 +2,8 @@
 
 #include <array>
 #include <optional>
+#include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -16,36 +18,33 @@ namespace DB
 
 class Arena;
 
-/// A count-record dedup pass (the publish's within-block pass or the seal's cross-mini pass)
-/// is bypassed after this many consecutive passes whose records almost all survived it - the
-/// pass costs a per-record candidate scan and finds nothing on a distinct stream. While
-/// bypassed, every `adaptive_dedup_resample_interval`-th pass runs the dedup anyway, so a
-/// stream whose distribution turns repetitive gets its dedup back.
+/// Count deduplication runs when building a candidate and when coalescing candidates. Each
+/// pass is bypassed after this many consecutive attempts remove almost no records. While
+/// bypassed, every `adaptive_dedup_resample_interval`-th attempt samples the stream again so
+/// a change in key distribution can re-enable deduplication.
 constexpr size_t adaptive_dedup_unproductive_passes_to_bypass = 4;
 constexpr size_t adaptive_dedup_resample_interval = 64;
 /// Staged batches smaller than this are coalesced into one bucket-grouped chunk before they
 /// reach the backlogs, so the merge-time drain processes a few large contiguous slices per
 /// bucket instead of one tiny slice per consumed block; a batch of at least half the target
 /// is enqueued as-is. Also bounds the coalescing buffer per thread.
-constexpr size_t adaptive_seal_target_bytes = 4 << 20;
+constexpr size_t adaptive_coalescing_target_bytes = 4 << 20;
 
 /// String-like keys stage their bytes: a packed reference copied as a plain value would
-/// carry a pointer into the source block, which dies when the publish compacts the
-/// arguments and releases it. The staged form of both string kinds is the raw characters,
+/// carry a pointer into the source block. Conversion copies key bytes and gathers arguments
+/// into owned columns so the source block can be released. Both string kinds stage raw characters,
 /// and the drain rebuilds the table's key from them (the pressure-time drain additionally
 /// persists the bytes into its arena; the merge-time drain borrows them).
 template <typename Key>
 constexpr bool adaptive_key_stages_bytes = std::is_same_v<Key, std::string_view> || std::is_same_v<Key, PackedStringRef>;
 
-
 /// The staged records route by the two-level bucket of their key's hash, so the backlogs and
 /// the routing structures come in the same 256 buckets as the two-level hash tables.
 inline constexpr size_t ADAPTIVE_AGGREGATION_NUM_BUCKETS = 256;
 
-/// All delayed records of one consumed block, grouped by bucket. One record batch per
-/// consumed block, rather than one per (block, bucket); a thread's small batches are
-/// further coalesced into one larger chunk of the same shape before they reach the
-/// backlogs.
+/// Owned delayed records grouped by bucket. Conversion builds one candidate per input block;
+/// coalescing combines small candidates, and pressure sizing can cut a candidate into pieces.
+/// Every chunk uses the same layout, independent of those boundaries.
 struct StagedChunk
 {
     /// The bucket-grouped key side of a staged chunk, shared by both payload modes: record i's
@@ -73,7 +72,7 @@ struct StagedChunk
         std::string_view keyBytesAt(size_t i) const { return {key_bytes.data() + keyByteOffsetAt(i), keySizeAt(i)}; }
     };
 
-    /// Value staging (simple-count aggregation only): the record is the key itself plus a run
+    /// Simple-count payload: the record is the key itself plus a run
     /// length - `multiplicities[i]` is how many source rows record i represents (repeats of a
     /// key collapse into one record at staging time).
     struct CountPayload
@@ -81,8 +80,8 @@ struct StagedChunk
         PaddedPODArray<UInt32> multiplicities;
     };
 
-    /// Row-reference staging (general aggregates): record i reads its aggregate arguments from
-    /// row i of `argument_columns`, which hold the records' values gathered at publish in the
+    /// General aggregate payload: record i reads its aggregate arguments from
+    /// row i of `argument_columns`, which hold the records' values gathered during conversion in the
     /// same bucket-grouped order, so a bucket's slice is a contiguous row range. Only the
     /// aggregate-argument positions are filled, kept at their original indexes so that the
     /// instruction preparation can index the vector; sparse arguments are materialized by the
@@ -107,13 +106,23 @@ struct StagedChunk
 
     bool countsOnly() const { return std::holds_alternative<CountPayload>(payload); }
 
-    /// Debug-only structural invariants, checked at publication.
-    bool wellFormed() const;
+    /// Returns logical key and payload bytes, excluding allocation headroom and prepared instructions.
+    size_t byteSize() const;
 
+    /// Returns allocated key and payload buffer bytes, excluding prepared instructions.
+    size_t allocatedBytes() const;
+
+    /// Copies a record range and rebases its bucket and key offsets. Aggregate instructions
+    /// must be prepared for the returned columns before admission.
+    MutableStagedChunkPtr cut(size_t start, size_t length) const;
+
+    /// Debug-only structural invariants, checked before admission.
+    bool isWellFormed() const;
 };
 
 /// Converts recorded frozen-table misses into owned, bucket-grouped chunks. The producer
-/// supplies aggregation metadata for each synchronous call and publishes returned chunks.
+/// supplies aggregation metadata when building a candidate. Buffering and coalescing use the
+/// candidate's owned payload; the producer prepares returned chunks for admission.
 class StagedChunkConverter
 {
 public:
@@ -124,24 +133,21 @@ public:
     PaddedPODArray<UInt64> miss_key_sizes;
     PaddedPODArray<UInt32> miss_multiplicities;
 
-
     /// Builds a candidate without clearing misses, which the producer still needs for thaw sampling.
     template <typename SharedKey, typename State>
     MutableStagedChunkPtr build(
         const Columns & columns,
         const ColumnNumbersList & aggregates_positions,
-        size_t aggregates_size,
         State & local_find_state,
         Arena & scratch_pool,
         bool counts_only,
         std::optional<UInt32> key_row_override);
 
-    /// Returns a large candidate immediately, or buffers small candidates until the seal target.
-    MutableStagedChunkPtr stage(
-        MutableStagedChunkPtr chunk, size_t estimated_payload_bytes, const ColumnNumbersList & aggregates_positions);
+    /// Returns a large candidate immediately, or coalesces buffered candidates once their byte target is reached.
+    MutableStagedChunkPtr stage(MutableStagedChunkPtr chunk);
 
     /// Returns the coalesced pending candidates, or null when there are none.
-    MutableStagedChunkPtr flush(const ColumnNumbersList & aggregates_positions);
+    MutableStagedChunkPtr flush();
 
     void clearMisses();
 
@@ -153,30 +159,26 @@ private:
     template <typename SharedKey, typename State>
     void buildBucketGroupedAggregateChunk(
         StagedChunk & block, const Columns & columns, const ColumnNumbersList & aggregates_positions,
-        size_t aggregates_size, State & local_find_state, Arena & scratch_pool, std::optional<UInt32> key_row_override);
+        State & local_find_state, Arena & scratch_pool, std::optional<UInt32> key_row_override);
 
-    MutableStagedChunkPtr sealPendingChunks(const ColumnNumbersList & aggregates_positions);
-    static void sealValueStagedChunkDeduplicated(const std::vector<MutableStagedChunkPtr> & minis, StagedChunk & chunk);
+    static void coalesceCountChunksWithDeduplication(const std::vector<MutableStagedChunkPtr> & minis, StagedChunk & chunk);
 
-    /// Scratch for the value-staged publish grouping: the records' staging indexes in group
+    /// Scratch for count-record grouping: the records' staging indexes in group
     /// order (the hashes stay in `miss_hashes`, so the entries are four bytes, not sixteen).
     std::vector<UInt32> grouped_index_scratch;
     std::vector<UInt32> group_offsets_scratch;
     std::vector<UInt32> group_cursor_scratch;
 
-    /// Productivity tracking of a count-record dedup pass. The publish's within-block pass and
-    /// the seal's cross-mini pass are tracked separately, because a stream can be distinct
-    /// within blocks yet repetitive across them. Bypassing is always correct - duplicate count
-    /// records merge at the drain's emplace - so a stale decision costs staged memory until
-    /// the next resample, never results.
+    /// Tracks deduplication when building and coalescing chunks separately: a stream can have
+    /// distinct keys within each block but repeated keys across blocks. Bypassed duplicates
+    /// still merge during draining, so bypassing affects staging cost without changing results.
     struct DedupProductivity
     {
         size_t consecutive_unproductive = 0;
         size_t passes_since_resample = 0;
         bool bypassed = false;
 
-        /// Whether the next pass should dedup: always while engaged, and periodically as a
-        /// resample while bypassed, so a distribution change re-engages the dedup.
+        /// Runs every pass while engaged and periodically while bypassed to detect distribution changes.
         bool shouldDedup()
         {
             if (!bypassed)
@@ -187,13 +189,11 @@ private:
             return true;
         }
 
-        /// Feeds back a pass that ran the dedup: one productive pass re-engages, enough
-        /// consecutive passes that merged almost nothing (less than 1/64 of the records)
-        /// bypass.
+        /// A productive pass re-enables deduplication. Consecutive passes that remove fewer
+        /// than 1/64 of their input records eventually enable bypassing.
         void record(size_t input_records, size_t surviving_records)
         {
-            if (input_records == 0)
-                return;
+            chassert(input_records != 0);
             if (surviving_records * 64 > input_records * 63)
             {
                 if (++consecutive_unproductive >= adaptive_dedup_unproductive_passes_to_bypass)
@@ -207,8 +207,8 @@ private:
         }
     };
 
-    DedupProductivity publish_dedup;
-    DedupProductivity seal_dedup;
+    DedupProductivity block_dedup;
+    DedupProductivity coalescing_dedup;
 
     /// Small per-block staging batches buffered for coalescing: they are merged into one
     /// bucket-grouped chunk before they reach the backlogs (see `stage`), so the
@@ -217,8 +217,5 @@ private:
     std::vector<MutableStagedChunkPtr> pending_chunks;
     size_t pending_staged_bytes = 0;
 };
-
-/// Copies a contiguous record range and rebases its bucket and key offsets. Preparation is rebuilt by the caller.
-MutableStagedChunkPtr sliceStagedChunk(const StagedChunk & source, size_t begin, size_t end);
 
 }

@@ -181,8 +181,6 @@ private:
 
     RowsBeforeStepCounterPtr rows_before_aggregation;
 
-    std::list<TemporaryBlockStreamHolder> tmp_files;
-
     RuntimeDataflowStatisticsCacheUpdaterPtr updater;
 
     Status prepareAdaptive();
@@ -191,13 +189,13 @@ private:
     void initGenerate();
 };
 
-/// Assembles the existing in-memory or external merge after all producers finish. The caller
-/// retains temporary-file holders for the lifetime of the returned reader pipeline.
+/// Assembles the in-memory or external merge after all producers finish. External reader
+/// sources own their temporary files for the lifetime of the returned pipeline.
 Processors createAggregationMergePipeline(
     const AggregatingTransformParamsPtr & params, const ManyAggregatedDataPtr & many_data,
     size_t max_threads, size_t temporary_data_merge_threads,
     bool should_produce_results_in_order_of_bucket_number, bool skip_merging,
-    const RuntimeDataflowStatisticsCacheUpdaterPtr & updater, std::list<TemporaryBlockStreamHolder> & tmp_files);
+    const RuntimeDataflowStatisticsCacheUpdaterPtr & updater);
 
 Chunk convertToChunk(const Block & block);
 

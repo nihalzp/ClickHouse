@@ -7,6 +7,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
+#include <Interpreters/AdaptiveAggregationExecution.h>
 
 namespace ProfileEvents
 {
@@ -35,25 +36,34 @@ bool AdaptiveAggregationSession::SpillReservation::reserveOrWait(
                 FailPointInjection::notifyPauseAndWaitForResume(FailPoints::adaptive_aggregation_before_spill_budget_wait););
         return ready;
     });
-    if (session_.cancelled.load(std::memory_order_relaxed) || !fits(session_, bytes_, budget_))
+    if (session_.cancelled.load(std::memory_order_relaxed))
         return false;
+    chassert(fits(session_, bytes_, budget_));
     grab(session_, bytes_);
     return true;
 }
 
-void Aggregator::prepareStagedChunk(StagedChunk & block) const
+StagedChunk::AggregatePayload::AggregatePayload() = default;
+StagedChunk::AggregatePayload::AggregatePayload(AggregatePayload &&) noexcept = default;
+StagedChunk::AggregatePayload & StagedChunk::AggregatePayload::operator=(AggregatePayload &&) noexcept
+    = default;
+StagedChunk::AggregatePayload::~AggregatePayload() = default;
+
+StagedChunkPtr Aggregator::prepareStagedChunk(MutableStagedChunkPtr block) const
 {
-    auto & payload = std::get<StagedChunk::AggregatePayload>(block.payload);
+    if (block->countsOnly())
+        return block;
+
+    auto & payload = std::get<StagedChunk::AggregatePayload>(block->payload);
 
     auto prep = std::make_unique<StagedChunkPreparation>();
     prep->aggregate_columns.resize(params.aggregates_size);
     prep->instructions.resize(params.aggregates_size + 1);
     prep->instructions[params.aggregates_size].that = nullptr;
 
-    /// The payload columns are already in the drain's form - the seal normalized them at the
-    /// gather - so the instructions wire the columns directly and only the combinator
-    /// unwrapping remains. Nothing dense is materialized here, and a staged payload is never
-    /// sparse.
+    /// Conversion normalizes gathered argument columns into the representation consumed by
+    /// the drain. Preparation wires those columns directly and unwraps combinators; it does
+    /// not materialize another copy of the arguments.
     for (size_t i = 0; i < params.aggregates_size; ++i)
     {
         prep->aggregate_columns[i].resize(params.aggregates[i].argument_names.size());
@@ -64,6 +74,7 @@ void Aggregator::prepareStagedChunk(StagedChunk & block) const
     }
 
     payload.prepared = std::move(prep);
+    return block;
 }
 
 void Aggregator::initAdaptiveSession(AggregatedDataVariants & local_result, AdaptiveAggregationSession & shared) const
@@ -82,14 +93,14 @@ void Aggregator::initAdaptiveSession(AggregatedDataVariants & local_result, Adap
 void Aggregator::prepareStagedChunks(
     const AdaptiveAggregationSession & shared, MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const
 {
-    chassert(block->wellFormed());
+    chassert(block->isWellFormed());
 
     /// The drains claim chunks whole, so a chunk is never let into the backlogs larger than
     /// the part its claim is bounded by (see `splitStagedChunkAtPartBound`).
     auto pieces = splitStagedChunkAtPartBound(shared, *block);
     if (pieces.empty())
     {
-        appendPreparedStagedChunk(std::move(block), ready_chunks);
+        ready_chunks.push_back(prepareStagedChunk(std::move(block)));
         return;
     }
 
@@ -102,19 +113,9 @@ void Aggregator::prepareStagedChunks(
     block.reset();
     for (auto & piece : pieces)
     {
-        chassert(piece->wellFormed());
-        appendPreparedStagedChunk(std::move(piece), ready_chunks);
+        chassert(piece->isWellFormed());
+        ready_chunks.push_back(prepareStagedChunk(std::move(piece)));
     }
-}
-
-void Aggregator::appendPreparedStagedChunk(MutableStagedChunkPtr block, std::vector<StagedChunkPtr> & ready_chunks) const
-{
-    /// Prepared here, on the publishing thread, so the chunk is immutable once any bucket can
-    /// see it.
-    if (std::holds_alternative<StagedChunk::AggregatePayload>(block->payload))
-        prepareStagedChunk(*block);
-
-    ready_chunks.push_back(std::move(block));
 }
 
 void Aggregator::admitStagedChunk(
@@ -182,68 +183,19 @@ void Aggregator::retireAdaptiveMergedBucket(AggregatedDataVariants & dest, Adapt
     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationBucketsRetired);
 }
 
-/// Thawing is the adaptive aggregation standing down globally: when the staged stream
-/// proves to keep repeating the same missing keys instead of bringing rare ones, every
-/// thread returns to ordinary insertion for good. A frozen table thaws; a thread still
-/// learning stops trying to freeze. Staging such a stream re-copies a repeated key's
-/// bytes on every occurrence, while an unfrozen table would absorb the repeats as cheap
-/// in-place updates.
+/// Estimates the cost of repeated staging across producers. A sampled hash identifies a key;
+/// sampled occurrences divided by distinct hashes estimates its repetition count. The verdict is
+/// `(repeat - 1) * bytes_per_record > adaptive_thaw_wasted_bytes_per_key` after enough evidence.
 ///
-/// The verdict is evaluated over totals shared by all threads; the tuning constants
-/// hold the calibration:
+/// The caller supplies hashes and bytes for the same records before count deduplication, so the
+/// ratio measures the stream presented to staging. Key bytes, routing metadata, count multiplicities,
+/// and variable-width argument values contribute to the estimate. Repeated variable-width arguments
+/// incur gathering and state-copying costs; fixed-width arguments use the same batch executor as
+/// ordinary aggregation and are excluded from the thaw estimate.
 ///
-///     wasted bytes per distinct key = (repeat - 1) * bytes per record
-///                                   > adaptive_thaw_wasted_bytes_per_key
-///
-/// Here repeat = thaw_sampled_records / distinct_sampled_hashes, and bytes per record =
-/// staged_bytes / staged_records. A key's first record is the price of storing it once;
-/// each repeat wastes one record's bytes, so heavy records tolerate few repeats and tiny
-/// ones many. Until the verdict fires, every publish folds its batch into the shared
-/// evidence and re-evaluates, so the thread whose batch tips the totals over the bound
-/// fires for everyone by setting `thaw_all`, once `staged_records` has reached the
-/// `adaptive_thaw_min_staged_records` evidence floor. A publish updates:
-///
-/// - `staged_records` grows by the batch's record count.
-/// - `staged_bytes` grows by the batch's estimated footprint, computed below as
-///   `batch_bytes`. It counts the key bytes as the kernel staged them, the variable-width
-///   aggregate arguments at their gathered sizes (the sealed chunk's columns hold exactly
-///   the staged rows, so a wide tail behind a narrow frequent head is charged its real
-///   width rather than the block's average), and the per-record bookkeeping the chunk
-///   stores (the eight-byte routing hash, plus an eight-byte key offset only for
-///   byte-staged keys; fixed keys have no offsets). A column read by several aggregates is staged
-///   once, so it is counted once; a count batch stages a four-byte run length instead of
-///   arguments.
-///   The estimate is taken before the count deduplication (which merges a batch's
-///   repeats of one key into a single record with a run length), so it charges every
-///   staged record. That is deliberate: `staged_records` also counts the records before
-///   deduplication, and the verdict's bytes per record is `staged_bytes` divided by
-///   `staged_records`, so the two counters must describe the same set of records for
-///   the ratio to mean anything.
-///   Variable-width arguments count in full because staging such a value pays real work
-///   at every step. The seal gathers it out of the block into the staged column (a copy),
-///   the staged chunk pins that memory until the merge drains it, and updating the
-///   aggregate state from it copies the value once more (a string min keeps its own copy
-///   of the winning value). A repeated key pays all of that on every occurrence, where
-///   an unfrozen table would have paid a single in-place state update, so each repeat of
-///   a heavy value is genuine waste.
-///   Fixed-width arguments are deliberately not counted because their staging copy is a
-///   few bytes and the drain consumes the staged batch with the same vectorized batch
-///   executor the scan would have used on the original block. Deferring such values
-///   moves the work without multiplying it, so their staging costs about what their
-///   consumption saves. Charging them would fire the thaw on streams where staging is in
-///   fact profitable. The measured anchor is a stream of five UInt64 arguments at repeat
-///   10: it stays a clear adaptive win, and counting its forty fixed bytes per record
-///   would have thawed it.
-/// - The sampler receives the batch's routing hashes matching `hash & 0xFF == 0`, about
-///   total / 256 of them, collected outside the lock. `thaw_sampled_records` counts
-///   every sampled occurrence; `distinct_sampled_hashes` collapses a key's repeats onto
-///   one entry across all threads, so their ratio estimates the stream's repeat factor
-///   independently of how the keys spread over the threads.
-///
-/// The verdict lands at each thread's next between-blocks check; a learning thread about
-/// to freeze also checks it at the crossing, so no table freezes against it. The current
-/// records are still published: their rows were deferred by the frozen kernel and only
-/// the drain will aggregate them.
+/// Sampling precedes the mutex; updating the accumulated evidence and deciding the verdict are
+/// serialized. A producer observes `thaw_all` before freezing or at its next post-block check. Records
+/// already deferred by a frozen kernel must still reach the drain, regardless of the verdict.
 void Aggregator::observeAdaptiveStagedRecords(
     AdaptiveAggregationSession & shared, const PaddedPODArray<UInt64> & hashes, size_t batch_bytes) const
 {
@@ -287,13 +239,13 @@ void Aggregator::observeAdaptiveStagedRecords(
                 static_cast<size_t>((repeat - 1.0) * (static_cast<double>(shared.staged_bytes) / static_cast<double>(shared.staged_records))));
         }
     }
-
 }
 
-void Aggregator::flushPendingChunks(AdaptiveAggregationProducer & adaptive, std::vector<StagedChunkPtr> & ready_chunks) const
+void Aggregator::flushPendingChunks(AdaptiveAggregationExecution & execution) const
 {
-    if (auto chunk = adaptive.converter.flush(aggregates_positions))
-        prepareStagedChunks(*adaptive.session, std::move(chunk), ready_chunks);
+    auto & producer = execution.producer;
+    if (auto chunk = producer.converter.flush())
+        prepareStagedChunks(*producer.session, std::move(chunk), execution.ready_chunks);
 }
 
 /// The flushed variants' sizes are meaningless by the time the external path finishes, so a

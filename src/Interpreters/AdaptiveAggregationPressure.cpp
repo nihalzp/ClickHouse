@@ -151,18 +151,8 @@ static AggregatedDataVariantsPtr detachSharedDrainTable(AdaptiveAggregationSessi
 /// of `Aggregator::adaptiveDrainRecordBytes` already covers.
 static size_t estimateStagedBytesWithKeyCopy(const StagedChunk & chunk)
 {
-    const size_t key_bytes = chunk.keys.key_bytes.allocated_bytes();
-    size_t bytes = chunk.keys.routing_hashes.allocated_bytes() + key_bytes + chunk.keys.key_offsets.allocated_bytes();
-    if (!chunk.keys.fixed_key_size)
-        bytes += key_bytes;
-
-    if (const auto * counts = std::get_if<StagedChunk::CountPayload>(&chunk.payload))
-        return bytes + counts->multiplicities.allocated_bytes();
-
-    for (const auto & column : std::get<StagedChunk::AggregatePayload>(chunk.payload).argument_columns)
-        if (column)
-            bytes += column->allocatedBytes();
-    return bytes;
+    const size_t copied_key_bytes = chunk.keys.fixed_key_size ? 0 : chunk.keys.key_bytes.allocated_bytes();
+    return chunk.allocatedBytes() + copied_key_bytes;
 }
 
 /// The staged footprint of the records [begin, end) of a chunk, charged the way `estimateStagedBytesWithKeyCopy`
@@ -284,7 +274,7 @@ std::vector<MutableStagedChunkPtr> Aggregator::splitStagedChunkAtPartBound(
     pieces.reserve(ranges.size());
     for (const auto & [begin, end] : ranges)
     {
-        pieces.push_back(sliceStagedChunk(chunk, begin, end));
+        pieces.push_back(chunk.cut(begin, end - begin));
 
         /// The piece is measured again as a whole, the way its range was measured bucket by
         /// bucket and record by record, so a piece that comes out over the bound is counted:

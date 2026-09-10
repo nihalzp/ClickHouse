@@ -16,9 +16,9 @@ AdaptiveAggregationMergeTransform::AdaptiveAggregationMergeTransform(
     , temporary_data_merge_threads(temporary_data_merge_threads_)
     , updater(std::move(updater_))
 {
-    auto header = std::make_shared<const Block>(params->getHeader());
+    const auto & header = outputs.front().getHeader();
     for (size_t i = 0; i < many_data->num_producers; ++i)
-        inputs.emplace_back(*header, this);
+        inputs.emplace_back(header, this);
 }
 
 IProcessor::Status AdaptiveAggregationMergeTransform::prepare(const UpdatedInputPorts & updated_inputs, const UpdatedOutputPorts &)
@@ -33,12 +33,13 @@ IProcessor::Status AdaptiveAggregationMergeTransform::prepare(const UpdatedInput
         return Status::Finished;
     }
 
-    if (!merge_initialized)
+    if (stage == Stage::WaitingForInputs)
     {
         if (!inputs_initialized)
         {
             for (auto & input : inputs)
             {
+                chassert(!input.hasData());
                 if (!input.isFinished())
                 {
                     input.setNeeded();
@@ -50,20 +51,17 @@ IProcessor::Status AdaptiveAggregationMergeTransform::prepare(const UpdatedInput
         else
         {
             for (const auto * input : updated_inputs)
+            {
+                chassert(!input->hasData());
                 if (input->isFinished())
                     unfinished_inputs.erase(input);
+            }
         }
         return unfinished_inputs.empty() ? Status::Ready : Status::NeedData;
     }
 
-    if (!pipeline_created)
-    {
-        if (!processors.empty())
-            return Status::UpdatePipeline;
-        output.finish();
-        many_data.reset();
-        return Status::Finished;
-    }
+    if (stage == Stage::ExpandingPipeline)
+        return Status::UpdatePipeline;
 
     auto & input = inputs.back();
     if (!output.canPush())
@@ -86,18 +84,21 @@ IProcessor::Status AdaptiveAggregationMergeTransform::prepare(const UpdatedInput
 
 void AdaptiveAggregationMergeTransform::work()
 {
+    chassert(stage == Stage::WaitingForInputs && inputs_initialized && unfinished_inputs.empty());
     processors = createAggregationMergePipeline(
         params, many_data, max_threads, temporary_data_merge_threads,
-        /*should_produce_results_in_order_of_bucket_number=*/false, /*skip_merging=*/false, updater, tmp_files);
-    merge_initialized = true;
+        /*should_produce_results_in_order_of_bucket_number=*/false, /*skip_merging=*/false, updater);
+    chassert(!processors.empty());
+    stage = Stage::ExpandingPipeline;
 }
 
 IProcessor::PipelineUpdate AdaptiveAggregationMergeTransform::updatePipeline()
 {
+    chassert(stage == Stage::ExpandingPipeline);
     auto & output = processors.back()->getOutputs().front();
     inputs.emplace_back(output.getHeader(), this);
     connect(output, inputs.back());
-    pipeline_created = true;
+    stage = Stage::ReadingMerge;
     for (auto & processor : processors)
         processor->inheritQueryPlanStepFromParent(*this, static_cast<size_t>(AggregatingStep::AggregatingStage::FinalAggregation));
     return PipelineUpdate{.to_add = std::move(processors), .to_remove = {}};

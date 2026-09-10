@@ -10,6 +10,13 @@ namespace DB
 /// survives a scheduler yield.
 struct AdaptiveAggregationExecution
 {
+    explicit AdaptiveAggregationExecution(AdaptiveAggregationProducer & producer_) : producer(producer_)
+    {
+    }
+
+    /// The producer outlives its execution storage, including cancellation cleanup.
+    AdaptiveAggregationProducer & producer;
+
     enum class Continuation
     {
         None,
@@ -31,9 +38,7 @@ struct AdaptiveAggregationExecution
     Finish finish = Finish::NotStarted;
     bool use_own_memory_tracker = false;
     size_t input_rows = 0;
-    size_t result_size = 0;
-    Int64 current_memory_usage = 0;
-    Int64 result_size_bytes = 0;
+    Aggregator::PostBlockSnapshot snapshot;
 
     Columns columns;
     Columns materialized_columns;

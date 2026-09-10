@@ -161,6 +161,7 @@ struct BlockExecution
         : params(std::move(params_))
         , session(std::make_shared<AdaptiveAggregationSession>())
         , adaptive(session)
+        , execution(adaptive)
         , key_columns(params->params.keys_size)
         , aggregate_columns(params->params.aggregates_size)
     {
@@ -170,7 +171,7 @@ struct BlockExecution
     {
         const size_t rows = chunk.getNumRows();
         return params->aggregator.executeOnBlock(
-            chunk.detachColumns(), 0, rows, result, key_columns, aggregate_columns, no_more_keys, &adaptive, &execution);
+            chunk.detachColumns(), 0, rows, result, key_columns, aggregate_columns, no_more_keys, &execution);
     }
 
     void admit(MemoryTracker & parent)
@@ -187,7 +188,7 @@ struct BlockExecution
     {
         onWorker(parent, [&]
         {
-            EXPECT_TRUE(params->aggregator.resumeAdaptiveBlock(adaptive, execution, result, no_more_keys));
+            EXPECT_TRUE(params->aggregator.resumeAdaptiveBlock(execution, result, no_more_keys));
         });
     }
 
@@ -412,18 +413,18 @@ TEST(AdaptiveAggregationPipeline, BothCheckpointsPreserveSnapshotsAndInputOwners
                 ASSERT_TRUE(block.adaptive.isFrozen());
                 ASSERT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::None);
                 ASSERT_TRUE(block.execution.ready_chunks.empty());
-                block.execution.result_size = 17;
-                block.execution.current_memory_usage = -1;
-                block.execution.result_size_bytes = -2;
+                block.execution.snapshot.groups = 17;
+                block.execution.snapshot.query_bytes = -1;
+                block.execution.snapshot.aggregation_bytes = -2;
                 auto input = keyRange(8192, 150000);
                 auto owner = input.getColumns().front();
                 ASSERT_TRUE(block.execute(std::move(input)));
                 ASSERT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::BeforeMemoryCheck);
                 ASSERT_FALSE(block.execution.ready_chunks.empty());
                 EXPECT_EQ(block.execution.use_own_memory_tracker, own_tracker);
-                EXPECT_EQ(block.execution.result_size, 17);
-                EXPECT_EQ(block.execution.current_memory_usage, -1);
-                EXPECT_EQ(block.execution.result_size_bytes, -2);
+                EXPECT_EQ(block.execution.snapshot.groups, 17);
+                EXPECT_EQ(block.execution.snapshot.query_bytes, -1);
+                EXPECT_EQ(block.execution.snapshot.aggregation_bytes, -2);
                 EXPECT_GT(owner->use_count(), 1);
                 EXPECT_EQ(CurrentThread::getMemoryTracker()->getParent(), &parent);
 
@@ -440,10 +441,10 @@ TEST(AdaptiveAggregationPipeline, BothCheckpointsPreserveSnapshotsAndInputOwners
                 ASSERT_FALSE(block.execution.ready_chunks.empty());
                 EXPECT_EQ(block.adaptive.isBaseline(), thaw);
                 EXPECT_GT(owner->use_count(), 1);
-                EXPECT_GE(block.execution.current_memory_usage, pressure_bytes);
-                const auto saved_size = block.execution.result_size;
-                const auto saved_memory = block.execution.current_memory_usage;
-                const auto saved_bytes = block.execution.result_size_bytes;
+                EXPECT_GE(block.execution.snapshot.query_bytes, pressure_bytes);
+                const auto saved_size = block.execution.snapshot.groups;
+                const auto saved_memory = block.execution.snapshot.query_bytes;
+                const auto saved_bytes = block.execution.snapshot.aggregation_bytes;
 
                 /// Another allocation during the pressure flush must not replace the saved snapshots.
                 query_tracker.adjustWithUntrackedMemory(pressure_bytes);
@@ -452,9 +453,9 @@ TEST(AdaptiveAggregationPipeline, BothCheckpointsPreserveSnapshotsAndInputOwners
                 ASSERT_GT(getCurrentQueryMemoryUsage(), saved_memory);
                 block.resume(parent);
                 EXPECT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::None);
-                EXPECT_EQ(block.execution.result_size, saved_size);
-                EXPECT_EQ(block.execution.current_memory_usage, saved_memory);
-                EXPECT_EQ(block.execution.result_size_bytes, saved_bytes);
+                EXPECT_EQ(block.execution.snapshot.groups, saved_size);
+                EXPECT_EQ(block.execution.snapshot.query_bytes, saved_memory);
+                EXPECT_EQ(block.execution.snapshot.aggregation_bytes, saved_bytes);
                 EXPECT_EQ(owner->use_count(), 1);
                 EXPECT_TRUE(block.execution.columns.empty());
                 EXPECT_TRUE(block.execution.materialized_columns.empty());
@@ -540,14 +541,14 @@ TEST(AdaptiveAggregationPipeline, AdmissionUsesThePublishingAllocationContext)
         ASSERT_TRUE(block.execute(keyRange(0, 64)));
         ASSERT_TRUE(block.execution.use_own_memory_tracker);
         ASSERT_TRUE(block.execute(keyRange(0, 0)));
-        const auto before = block.execution.result_size_bytes;
+        const auto before = block.execution.snapshot.aggregation_bytes;
         auto chunk = makeStagedChunk();
         onWorker(query_tracker, [&]
         {
             block.params->aggregator.admitStagedChunk(*block.session, chunk, own_tracker);
         });
         ASSERT_TRUE(block.execute(keyRange(0, 0)));
-        EXPECT_EQ(block.execution.result_size_bytes - before, own_tracker ? sizeof(StagedChunkPtr) : 0);
+        EXPECT_EQ(block.execution.snapshot.aggregation_bytes - before, own_tracker ? sizeof(StagedChunkPtr) : 0);
     }
 }
 
@@ -615,7 +616,7 @@ TEST(AdaptiveAggregationPipeline, CancellationWakesPressureWorkWaitingForSpillBu
     {
         ThreadStatus thread_status;
         MemoryTrackerSwitcher switcher(&query_tracker);
-        return params->aggregator.resumeAdaptiveBlock(block.adaptive, block.execution, block.result, block.no_more_keys);
+        return params->aggregator.resumeAdaptiveBlock(block.execution, block.result, block.no_more_keys);
     });
     SCOPE_EXIT({
         FailPointInjection::disableFailPoint(FailPoints::adaptive_aggregation_before_spill_budget_wait);
@@ -643,7 +644,7 @@ TEST(AdaptiveAggregationPipeline, CancellationWakesPressureWorkWaitingForSpillBu
 }
 #endif
 
-TEST(AdaptiveAggregationPipeline, FinalAssemblyIncludesLateSpillsAndOwnsTemporaryFiles)
+TEST(AdaptiveAggregationPipeline, FinalAssemblyIncludesLateSpillsAndReadersOwnTemporaryFiles)
 {
     MainThreadStatus::getInstance();
     for (const bool late_producer_spill : {false, true})
@@ -735,10 +736,16 @@ TEST(AdaptiveAggregationPipeline, FinalAssemblyIncludesLateSpillsAndOwnsTemporar
         EXPECT_FALSE(params->aggregator.hasTemporaryData());
         EXPECT_EQ(session->backlog.undrainedRecords(), 0);
 
-        /// Execute the assembled readers while the coordinator retains their temporary-file holders.
+        /// The reader pipeline owns its files independently of the completion coordinator.
         auto update = merge->updatePipeline();
         auto & output = update.to_add.back()->getOutputs().front();
         disconnect(output, merge->getInputs().back());
+        disconnect(merge->getOutputs().front(), result);
+        auto completion_port = merge->getInputs().begin();
+        for (auto & admission : admissions)
+            disconnect(admission->getOutputs().front(), *completion_port++);
+        merge.reset();
+        ASSERT_GT(tmp_data->currentCompressedSize(), 0);
         auto sink = std::make_shared<KeySink>(header);
         connect(output, sink->getPort());
         auto processors = std::make_shared<Processors>(std::move(update.to_add));
@@ -750,9 +757,8 @@ TEST(AdaptiveAggregationPipeline, FinalAssemblyIncludesLateSpillsAndOwnsTemporar
         constexpr UInt64 expected_rows = num_producers * rows_per_producer;
         EXPECT_EQ(sink->rows, expected_rows);
         EXPECT_EQ(sink->sum, expected_rows * (expected_rows - 1) / 2);
-        processors.reset();
         EXPECT_GT(tmp_data->currentCompressedSize(), 0);
-        merge.reset();
+        processors.reset();
         EXPECT_EQ(tmp_data->currentCompressedSize(), 0);
     }
 }

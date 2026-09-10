@@ -29,11 +29,15 @@ private:
     size_t temporary_data_merge_threads;
     RuntimeDataflowStatisticsCacheUpdaterPtr updater;
     Processors processors;
-    std::list<TemporaryBlockStreamHolder> tmp_files;
     std::unordered_set<const InputPort *> unfinished_inputs;
     bool inputs_initialized = false;
-    bool merge_initialized = false;
-    bool pipeline_created = false;
+    enum class Stage
+    {
+        WaitingForInputs,
+        ExpandingPipeline,
+        ReadingMerge,
+    };
+    Stage stage = Stage::WaitingForInputs;
 };
 
 }

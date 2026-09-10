@@ -2219,9 +2219,9 @@ bool Aggregator::executeOnBlock(Columns columns,
     ColumnRawPtrs & key_columns,
     AggregateColumns & aggregate_columns,
     bool & no_more_keys,
-    AdaptiveAggregationProducer * adaptive,
     AdaptiveAggregationExecution * execution) const
 {
+    auto * adaptive = execution ? &execution->producer : nullptr;
     /// When tracking the aggregation memory, the aggregator memory tracker is inserted between the thread
     /// and query memory trackers, and accounts for the aggregation state across all threads.
     const bool use_own_tracker = memory_tracker && CurrentThread::getMemoryTracker()
@@ -2384,11 +2384,7 @@ bool Aggregator::executeOnBlock(Columns columns,
     }
     else
     {
-        const size_t result_size = result.sizeWithoutOverflowRow();
-        const Int64 current_memory_usage = getCurrentQueryMemoryUsage();
-        const Int64 result_size_bytes = use_own_tracker ? memory_tracker->get() : current_memory_usage - memory_usage_before_aggregation;
-        should_continue = finishOnBlock(
-            result, no_more_keys, row_end - row_begin, result_size, current_memory_usage, result_size_bytes, adaptive, execution);
+        should_continue = finishOnBlock(result, no_more_keys, getPostBlockSnapshot(result, use_own_tracker), execution);
     }
 
     if (execution && execution->continuation != AdaptiveAggregationExecution::Continuation::None)
@@ -2401,17 +2397,22 @@ bool Aggregator::executeOnBlock(Columns columns,
     return should_continue;
 }
 
-bool Aggregator::finishOnBlock(
-    AggregatedDataVariants & result, bool & no_more_keys, size_t input_rows,
-    size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
-    AdaptiveAggregationProducer * adaptive, AdaptiveAggregationExecution * execution) const
+Aggregator::PostBlockSnapshot Aggregator::getPostBlockSnapshot(
+    const AggregatedDataVariants & result, bool use_own_memory_tracker) const
 {
+    const size_t groups = result.sizeWithoutOverflowRow();
+    const Int64 query_bytes = getCurrentQueryMemoryUsage();
+    const Int64 aggregation_bytes = use_own_memory_tracker ? memory_tracker->get() : query_bytes - memory_usage_before_aggregation;
+    return {.groups = groups, .query_bytes = query_bytes, .aggregation_bytes = aggregation_bytes};
+}
+
+bool Aggregator::finishOnBlock(
+    AggregatedDataVariants & result, bool & no_more_keys,
+    const PostBlockSnapshot & snapshot, AdaptiveAggregationExecution * execution) const
+{
+    auto * adaptive = execution ? &execution->producer : nullptr;
     if (execution)
-    {
-        execution->result_size = result_size;
-        execution->current_memory_usage = current_memory_usage;
-        execution->result_size_bytes = result_size_bytes;
-    }
+        execution->snapshot = snapshot;
 
     if (adaptive && !adaptive->isBaseline())
     {
@@ -2423,7 +2424,7 @@ bool Aggregator::finishOnBlock(
             /// A thread that has not frozen yet stands down the same way, so that it does not
             /// freeze against the verdict.
             if (adaptive->isFrozen())
-                LOG_TRACE(log, "Adaptive aggregation: thawed the local table at {} keys", result_size);
+                LOG_TRACE(log, "Adaptive aggregation: thawed the local table at {} keys", snapshot.groups);
             adaptive->standDown(AdaptiveAggregationProducer::BaselineState::Reason::RepeatedStagedKeys);
         }
         else
@@ -2442,7 +2443,7 @@ bool Aggregator::finishOnBlock(
                 /// tables off each other's growth.
                 const bool freeze_bytes_reached = params.adaptive_aggregator_freeze_threshold_bytes
                     && result.allocatedBytes() >= params.adaptive_aggregator_freeze_threshold_bytes;
-                if ((result_size >= params.adaptive_aggregator_freeze_threshold || freeze_bytes_reached)
+                if ((snapshot.groups >= params.adaptive_aggregator_freeze_threshold || freeze_bytes_reached)
                     && result.isConvertibleToTwoLevel())
                     freezeAdaptive(result, *adaptive);
             }
@@ -2456,9 +2457,9 @@ bool Aggregator::finishOnBlock(
                 /// branch below (a spilled table converts to two-level, which the frozen kernel
                 /// cannot pair with its twin).
                 if (params.max_bytes_before_external_group_by
-                    && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by))
+                    && snapshot.query_bytes > static_cast<Int64>(params.max_bytes_before_external_group_by))
                 {
-                    flushPendingChunks(*adaptive, execution->ready_chunks);
+                    flushPendingChunks(*execution);
                     if (!execution->ready_chunks.empty())
                     {
                         execution->continuation = AdaptiveAggregationExecution::Continuation::FrozenPressureDrain;
@@ -2468,7 +2469,7 @@ bool Aggregator::finishOnBlock(
                 }
 
                 /// Checking the constraints.
-                if (!checkLimits(result_size, no_more_keys))
+                if (!checkLimits(snapshot.groups, no_more_keys))
                     return false;
 
                 return true;
@@ -2481,20 +2482,20 @@ bool Aggregator::finishOnBlock(
             /// bucket-parallel merge), or the hot share is so extreme that staging the sliver of
             /// a tail cannot pay. The thread falls back to the baseline checks below, permanently.
             auto & learning = std::get<AdaptiveAggregationProducer::LearningState>(adaptive->phase);
-            learning.rows_seen += input_rows;
+            learning.rows_seen += execution->input_rows;
             if (learning.rows_seen >= adaptive_freeze_give_up_row_multiple * params.adaptive_aggregator_freeze_threshold
-                && result_size < params.adaptive_aggregator_freeze_threshold)
+                && snapshot.groups < params.adaptive_aggregator_freeze_threshold)
             {
                 const size_t rows_seen = learning.rows_seen;
                 adaptive->standDown(AdaptiveAggregationProducer::BaselineState::Reason::TooFewDistinctKeys);
                 ProfileEvents::increment(ProfileEvents::AdaptiveAggregationGiveUps);
-                LOG_TRACE(log, "Adaptive aggregation: giving up on freezing after {} rows at {} keys", rows_seen, result_size);
+                LOG_TRACE(log, "Adaptive aggregation: giving up on freezing after {} rows at {} keys", rows_seen, snapshot.groups);
             }
 
             /// A learning table has no frozen twin to pair with and nothing staged, so unlike the
             /// frozen one it can join the baseline path for good and spill through the branch below.
             if (params.max_bytes_before_external_group_by
-                && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by))
+                && snapshot.query_bytes > static_cast<Int64>(params.max_bytes_before_external_group_by))
             {
                 if (adaptive->isLearning())
                     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationPressureStandDowns);
@@ -2504,7 +2505,7 @@ bool Aggregator::finishOnBlock(
             if (!adaptive->isBaseline())
             {
                 /// Checking the constraints.
-                if (!checkLimits(result_size, no_more_keys))
+                if (!checkLimits(snapshot.groups, no_more_keys))
                     return false;
 
                 return true;
@@ -2528,10 +2529,10 @@ bool Aggregator::finishOnBlock(
     /// `RepeatedStagedKeys` would only make the query wait for a thaw, or for a frozen producer to
     /// reach its own trigger, to free memory that already holds the query over the threshold.
     if (adaptive && adaptive->isBaseline() && params.max_bytes_before_external_group_by
-        && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by)
+        && snapshot.query_bytes > static_cast<Int64>(params.max_bytes_before_external_group_by)
         && adaptive->session->initialized.load(std::memory_order_acquire))
     {
-        flushPendingChunks(*adaptive, execution->ready_chunks);
+        flushPendingChunks(*execution);
         if (!execution->ready_chunks.empty())
         {
             execution->continuation = AdaptiveAggregationExecution::Continuation::BaselinePressureDrain;
@@ -2543,16 +2544,16 @@ bool Aggregator::finishOnBlock(
             ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
     }
 
-    return finishBaselineBlock(result, no_more_keys, result_size, current_memory_usage, result_size_bytes, adaptive);
+    return finishBaselineBlock(result, no_more_keys, snapshot, adaptive);
 }
 
 bool Aggregator::finishBaselineBlock(
     AggregatedDataVariants & result, bool & no_more_keys,
-    size_t result_size, Int64 current_memory_usage, Int64 result_size_bytes,
-    AdaptiveAggregationProducer * adaptive) const
+    const PostBlockSnapshot & snapshot, AdaptiveAggregationProducer * adaptive) const
 {
+    chassert(!adaptive || adaptive->isBaseline());
     bool worth_convert_to_two_level = worthConvertToTwoLevel(
-        params.group_by_two_level_threshold, result_size, params.group_by_two_level_threshold_bytes, result_size_bytes);
+        params.group_by_two_level_threshold, snapshot.groups, params.group_by_two_level_threshold_bytes, snapshot.aggregation_bytes);
 
     /** Converting to a two-level data structure.
       * It allows you to make, in the subsequent, an effective merge - either economical from memory or parallel.
@@ -2561,16 +2562,16 @@ bool Aggregator::finishBaselineBlock(
         result.convertToTwoLevel();
 
     /// Checking the constraints.
-    if (!checkLimits(result_size, no_more_keys))
+    if (!checkLimits(snapshot.groups, no_more_keys))
         return false;
 
     /// The spill below is decided from query-wide memory but can only free this thread's own
     /// table. The session's shared drain table is memory no sweep writes once it is below the
     /// part floor, so left resident it keeps every later block over the threshold.
-    Int64 spill_decision_memory = current_memory_usage;
-    if (adaptive && adaptive->isBaseline() && params.max_bytes_before_external_group_by
+    Int64 spill_decision_memory = snapshot.query_bytes;
+    if (adaptive && params.max_bytes_before_external_group_by
         && result.isTwoLevel() && worth_convert_to_two_level
-        && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by))
+        && snapshot.query_bytes > static_cast<Int64>(params.max_bytes_before_external_group_by))
     {
         /// The backlog itself was already shed above, under the same trigger; what is left here
         /// is the residue below the sweeps' part bound, which no sweep writes.
@@ -2594,9 +2595,11 @@ bool Aggregator::finishBaselineBlock(
 }
 
 bool Aggregator::resumeAdaptiveBlock(
-    AdaptiveAggregationProducer & adaptive, AdaptiveAggregationExecution & execution,
-    AggregatedDataVariants & result, bool & no_more_keys) const
+    AdaptiveAggregationExecution & execution, AggregatedDataVariants & result, bool & no_more_keys) const
 {
+    auto & adaptive = execution.producer;
+    chassert(execution.ready_chunks.empty());
+    chassert(execution.continuation != AdaptiveAggregationExecution::Continuation::None);
     std::optional<MemoryTrackerSwitcher> memory_tracker_switcher;
     if (execution.use_own_memory_tracker)
         memory_tracker_switcher.emplace(memory_tracker.get());
@@ -2607,26 +2610,22 @@ bool Aggregator::resumeAdaptiveBlock(
     {
         case AdaptiveAggregationExecution::Continuation::BeforeMemoryCheck:
         {
-            const size_t result_size = result.sizeWithoutOverflowRow();
-            const Int64 current_memory_usage = getCurrentQueryMemoryUsage();
-            const Int64 result_size_bytes = execution.use_own_memory_tracker
-                ? memory_tracker->get() : current_memory_usage - memory_usage_before_aggregation;
             should_continue = finishOnBlock(
-                result, no_more_keys, execution.input_rows, result_size, current_memory_usage, result_size_bytes, &adaptive, &execution);
+                result, no_more_keys, getPostBlockSnapshot(result, execution.use_own_memory_tracker), &execution);
             break;
         }
         case AdaptiveAggregationExecution::Continuation::FrozenPressureDrain:
             drainStagedChunksUnderMemoryPressure(*adaptive.session);
-            should_continue = checkLimits(execution.result_size, no_more_keys);
+            should_continue = checkLimits(execution.snapshot.groups, no_more_keys);
             break;
         case AdaptiveAggregationExecution::Continuation::BaselinePressureDrain:
             if (drainStagedChunksUnderMemoryPressure(*adaptive.session))
                 ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
             should_continue = finishBaselineBlock(
-                result, no_more_keys, execution.result_size, execution.current_memory_usage, execution.result_size_bytes, &adaptive);
+                result, no_more_keys, execution.snapshot, &adaptive);
             break;
         case AdaptiveAggregationExecution::Continuation::None:
-            std::unreachable();
+            UNREACHABLE();
     }
 
     if (execution.continuation == AdaptiveAggregationExecution::Continuation::None)
