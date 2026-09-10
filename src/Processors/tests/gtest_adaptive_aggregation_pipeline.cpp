@@ -3,8 +3,10 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <map>
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/CurrentThread.h>
 #include <Common/FailPoint.h>
@@ -15,6 +17,7 @@
 #include <Common/assert_cast.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Common/tests/gtest_global_register.h>
+#include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/tests/gtest_disk.h>
@@ -63,7 +66,7 @@ AggregatingTransformParamsPtr makeParams(
         if (aggregate != "count")
         {
             description.argument_names = {"key"};
-            arguments = {std::make_shared<DataTypeUInt64>()};
+            arguments = {header->getByName("key").type};
         }
         description.function = AggregateFunctionFactory::instance().get(aggregate, NullsAction::EMPTY, arguments, {}, properties);
         description.column_name = aggregate;
@@ -389,7 +392,7 @@ TEST(AdaptiveAggregationPipeline, CompletionUsesUpdatedPortsAndCountsEachClosure
     EXPECT_EQ(merge.prepare({third_input}, {}), IProcessor::Status::Ready);
 }
 
-TEST(AdaptiveAggregationPipeline, BothCheckpointsPreserveSnapshotsAndInputOwnersAcrossWorkers)
+TEST(AdaptiveAggregationPipeline, AdmissionCheckpointsPreserveInputAndConversionDecision)
 {
     MainThreadStatus::getInstance();
     for (const String aggregate : {"", "count", "sum"})
@@ -403,7 +406,10 @@ TEST(AdaptiveAggregationPipeline, BothCheckpointsPreserveSnapshotsAndInputOwners
                 SCOPED_TRACE(own_tracker);
                 MemoryTracker query_tracker(nullptr, VariableContext::Process, false);
                 MemoryTrackerSwitcher query_scope(&query_tracker);
-                auto params = makeParams(makeHeader(), 64 << 20, aggregate);
+                auto header = makeHeader();
+                auto aggregation_params = makeParams(header, 64 << 20, aggregate)->params;
+                aggregation_params.group_by_two_level_threshold_bytes = 192 << 20;
+                auto params = std::make_shared<AggregatingTransformParams>(header, aggregation_params, true);
                 MemoryTracker nested_tracker(&query_tracker, VariableContext::Thread, false);
                 auto & parent = own_tracker ? query_tracker : nested_tracker;
                 MemoryTrackerSwitcher execution_scope(&parent);
@@ -412,20 +418,14 @@ TEST(AdaptiveAggregationPipeline, BothCheckpointsPreserveSnapshotsAndInputOwners
                 /// The first candidate stays buffered; the next one is large enough to pass through.
                 ASSERT_TRUE(block.execute(keyRange(0, 8192)));
                 ASSERT_TRUE(block.adaptive.isFrozen());
-                ASSERT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::None);
+                ASSERT_FALSE(block.execution.hasPendingBlock());
                 ASSERT_TRUE(block.execution.ready_chunks.empty());
-                block.execution.snapshot.groups = 17;
-                block.execution.snapshot.query_bytes = -1;
-                block.execution.snapshot.aggregation_bytes = -2;
                 auto input = keyRange(8192, 150000);
                 auto owner = input.getColumns().front();
                 ASSERT_TRUE(block.execute(std::move(input)));
-                ASSERT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::BeforeMemoryCheck);
+                ASSERT_TRUE(block.execution.hasPendingBlock());
                 ASSERT_FALSE(block.execution.ready_chunks.empty());
                 EXPECT_EQ(block.execution.use_own_memory_tracker, own_tracker);
-                EXPECT_EQ(block.execution.snapshot.groups, 17);
-                EXPECT_EQ(block.execution.snapshot.query_bytes, -1);
-                EXPECT_EQ(block.execution.snapshot.aggregation_bytes, -2);
                 EXPECT_GT(owner->use_count(), 1);
                 EXPECT_EQ(CurrentThread::getMemoryTracker()->getParent(), &parent);
 
@@ -436,35 +436,86 @@ TEST(AdaptiveAggregationPipeline, BothCheckpointsPreserveSnapshotsAndInputOwners
                 block.admit(parent);
                 block.session->thaw_all.store(thaw);
                 block.resume(parent);
-                ASSERT_EQ(block.execution.continuation, thaw
-                    ? AdaptiveAggregationExecution::Continuation::BaselinePressureDrain
-                    : AdaptiveAggregationExecution::Continuation::FrozenPressureDrain);
+                ASSERT_TRUE(block.execution.hasPendingBlock());
                 ASSERT_FALSE(block.execution.ready_chunks.empty());
                 EXPECT_EQ(block.adaptive.isBaseline(), thaw);
                 EXPECT_GT(owner->use_count(), 1);
-                EXPECT_GE(block.execution.snapshot.query_bytes, pressure_bytes);
-                const auto saved_size = block.execution.snapshot.groups;
-                const auto saved_memory = block.execution.snapshot.query_bytes;
-                const auto saved_bytes = block.execution.snapshot.aggregation_bytes;
 
-                /// Another allocation during the pressure flush must not replace the saved snapshots.
+                /// Query memory crosses the two-level threshold during admission. A thawed producer
+                /// using query-wide accounting must retain its earlier decision to stay single-level.
                 query_tracker.adjustWithUntrackedMemory(pressure_bytes);
                 SCOPE_EXIT({ query_tracker.adjustWithUntrackedMemory(-pressure_bytes); });
                 block.admit(parent);
-                ASSERT_GT(getCurrentQueryMemoryUsage(), saved_memory);
+                ASSERT_GT(getCurrentQueryMemoryUsage(), 192 << 20);
                 block.resume(parent);
-                EXPECT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::None);
-                EXPECT_EQ(block.execution.snapshot.groups, saved_size);
-                EXPECT_EQ(block.execution.snapshot.query_bytes, saved_memory);
-                EXPECT_EQ(block.execution.snapshot.aggregation_bytes, saved_bytes);
+                EXPECT_FALSE(block.execution.hasPendingBlock());
                 EXPECT_EQ(owner->use_count(), 1);
-                EXPECT_TRUE(block.execution.columns.empty());
-                EXPECT_TRUE(block.execution.materialized_columns.empty());
-                EXPECT_TRUE(block.execution.instructions.empty());
+                EXPECT_FALSE(block.result.isTwoLevel());
                 EXPECT_EQ(block.session->backlog.undrainedRecords(), 0);
                 EXPECT_EQ(block.result.size() + block.session->early_drain_variants->size(), 158192);
                 EXPECT_FALSE(params->aggregator.hasTemporaryData());
             }
+        }
+    }
+}
+
+TEST(AdaptiveAggregationPipeline, FrozenConstantMissesPreserveCountsAndArguments)
+{
+    MainThreadStatus::getInstance();
+    for (const bool string_keys : {false, true})
+    {
+        for (const String aggregate : {"", "count", "max"})
+        {
+            SCOPED_TRACE(string_keys);
+            SCOPED_TRACE(aggregate);
+            DataTypePtr key_type = string_keys
+                ? DataTypePtr(std::make_shared<DataTypeString>()) : std::make_shared<DataTypeUInt64>();
+            auto header = std::make_shared<const Block>(Block{ColumnWithTypeAndName(key_type, "key")});
+            auto aggregation_params = makeParams(header, 0, aggregate)->params;
+            aggregation_params.optimize_group_by_constant_keys = true;
+            auto params = std::make_shared<AggregatingTransformParams>(header, aggregation_params, true);
+            BlockExecution block(params);
+            const auto key = [&](UInt64 value) { return string_keys ? Field(std::to_string(value)) : Field(value); };
+            std::map<Field, Field> expected;
+            auto learning_keys = key_type->createColumn();
+            for (UInt64 i = 0; i < 64; ++i)
+            {
+                learning_keys->insert(key(i));
+                expected.emplace(key(i), aggregate == "max" ? key(i) : Field(UInt64(1)));
+            }
+            ASSERT_TRUE(block.execute(Chunk(Columns{std::move(learning_keys)}, 64)));
+            ASSERT_TRUE(block.adaptive.isFrozen());
+
+            /// New constant keys must miss the frozen table. Repeated blocks exercise coalescing,
+            /// while the constant's one stored row must supply every staged argument row.
+            for (const size_t rows : {17, 23})
+            {
+                auto column = key_type->createColumnConst(rows, key(1000));
+                ASSERT_TRUE(block.execute(Chunk(Columns{std::move(column)}, rows)));
+                ASSERT_FALSE(block.execution.hasPendingBlock());
+            }
+            expected.emplace(key(1000), aggregate == "max" ? key(1000) : Field(UInt64(aggregate == "count" ? 40 : 1)));
+            params->aggregator.flushPendingChunks(block.execution);
+            ASSERT_FALSE(block.execution.ready_chunks.empty());
+            /// Count sampling retains both block contributions before coalescing merges their equal keys.
+            if (aggregate == "count")
+                EXPECT_EQ(block.session->staged_records, 2);
+            for (const auto & chunk : block.execution.ready_chunks)
+                params->aggregator.admitStagedChunk(*block.session, chunk, block.execution.use_own_memory_tracker);
+            block.execution.ready_chunks.clear();
+
+            block.result.convertToTwoLevel();
+            for (size_t bucket = 0; bucket < ADAPTIVE_AGGREGATION_NUM_BUCKETS; ++bucket)
+                params->aggregator.drainAdaptiveBucketForMerge(
+                    block.result, block.result.aggregates_pool, bucket, *block.session, block.session->cancelled);
+            std::map<Field, Field> actual;
+            for (const auto & result : params->aggregator.convertToChunks(block.result, true))
+            {
+                const auto & columns = result.chunk.getColumns();
+                for (size_t row = 0; row < result.chunk.getNumRows(); ++row)
+                    EXPECT_TRUE(actual.emplace((*columns[0])[row], aggregate.empty() ? Field(UInt64(1)) : (*columns[1])[row]).second);
+            }
+            EXPECT_EQ(actual, expected);
         }
     }
 }
@@ -538,18 +589,25 @@ TEST(AdaptiveAggregationPipeline, AdmissionUsesThePublishingAllocationContext)
         SCOPED_TRACE(own_tracker);
         MemoryTracker query_tracker(nullptr, VariableContext::Process, false);
         MemoryTrackerSwitcher query_scope(&query_tracker);
-        BlockExecution block(makeParams(makeHeader()));
+        auto header = makeHeader();
+        auto aggregation_params = makeParams(header, 0, "count")->params;
+        aggregation_params.group_by_two_level_threshold_bytes = 64 << 10;
+        auto params = std::make_shared<AggregatingTransformParams>(header, aggregation_params, true);
+        BlockExecution block(params);
+        block.adaptive.standDown(AdaptiveAggregationProducer::BaselineState::Reason::TooFewDistinctKeys);
         ASSERT_TRUE(block.execute(keyRange(0, 64)));
         ASSERT_TRUE(block.execution.use_own_memory_tracker);
-        ASSERT_TRUE(block.execute(keyRange(0, 0)));
-        const auto before = block.execution.snapshot.aggregation_bytes;
+        ASSERT_FALSE(block.result.isTwoLevel());
         auto chunk = makeStagedChunk();
         onWorker(query_tracker, [&]
         {
-            block.params->aggregator.admitStagedChunk(*block.session, chunk, own_tracker);
+            /// The backlog references exceed the conversion threshold regardless of allocation
+            /// headroom. They contribute to the aggregation account only when requested by the producer.
+            for (size_t i = 0; i < 8192; ++i)
+                block.params->aggregator.admitStagedChunk(*block.session, chunk, own_tracker);
         });
         ASSERT_TRUE(block.execute(keyRange(0, 0)));
-        EXPECT_EQ(block.execution.snapshot.aggregation_bytes - before, own_tracker ? sizeof(StagedChunkPtr) : 0);
+        EXPECT_EQ(block.result.isTwoLevel(), own_tracker);
     }
 }
 
@@ -606,7 +664,7 @@ TEST(AdaptiveAggregationPipeline, CancellationWakesPressureWorkWaitingForSpillBu
     query_tracker.adjustWithUntrackedMemory(pressure_bytes);
     SCOPE_EXIT({ query_tracker.adjustWithUntrackedMemory(-pressure_bytes); });
     block.resume(query_tracker);
-    ASSERT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::FrozenPressureDrain);
+    ASSERT_TRUE(block.execution.hasPendingBlock());
     block.admit(query_tracker);
 
     AdaptiveAggregationSession::SpillReservation writer;
@@ -638,8 +696,7 @@ TEST(AdaptiveAggregationPipeline, CancellationWakesPressureWorkWaitingForSpillBu
     writer.release();
     EXPECT_TRUE(worker.get());
     EXPECT_TRUE(block.session->cancelled.load());
-    EXPECT_EQ(block.execution.continuation, AdaptiveAggregationExecution::Continuation::None);
-    EXPECT_TRUE(block.execution.columns.empty());
+    EXPECT_FALSE(block.execution.hasPendingBlock());
     EXPECT_FALSE(params->aggregator.hasTemporaryData());
     EXPECT_EQ(block.session->estimated_detached_spill_bytes, 0);
 }
