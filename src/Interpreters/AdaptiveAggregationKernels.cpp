@@ -27,8 +27,6 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-}
-
 namespace
 {
     /// Whether the string views the state's key holders hand out point into storage that
@@ -44,10 +42,21 @@ namespace
         else
             return true;
     }
-}
 
-namespace DB
-{
+    void updateProbeBypass(AdaptiveAggregationProducer::FrozenState & frozen, size_t hits, size_t rows)
+    {
+        if (frozen.bypass_local_probe)
+            return;
+        frozen.sampled_hits += hits;
+        frozen.sampled_rows += rows;
+        if (frozen.sampled_rows >= adaptive_bypass_sample_rows
+            && frozen.sampled_hits * adaptive_bypass_hit_rate_inverse < frozen.sampled_rows)
+        {
+            frozen.bypass_local_probe = true;
+            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationProbeBypasses);
+        }
+    }
+}
 
 void Aggregator::executeFrozen(
     const Columns & columns,
@@ -109,13 +118,10 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     auto & frozen = std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase);
     const bool bypass_local_probe = frozen.bypass_local_probe;
 
-    auto stage_miss = [&]([[maybe_unused]] const auto & key, UInt64 hash, size_t row)
+    auto stage_miss = [&](const auto & key, UInt64 hash, size_t row)
     {
-        adaptive.converter.miss_source_rows.push_back(static_cast<UInt32>(row));
-        adaptive.converter.miss_hashes.push_back(hash);
-        adaptive.converter.miss_buckets.push_back(static_cast<UInt8>(SharedMethod::Data::getBucketFromHash(hash)));
-        if constexpr (adaptive_key_stages_bytes<typename SharedMethod::Key>)
-            adaptive.converter.miss_key_sizes.push_back(adaptiveStagedKeyBytes(key).size());
+        adaptive.converter.recordMiss<typename SharedMethod::Key>(
+            static_cast<UInt32>(row), hash, static_cast<UInt8>(SharedMethod::Data::getBucketFromHash(hash)), key);
     };
 
     if (all_keys_are_const)
@@ -151,17 +157,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
         keyHolderDiscardKey(key_holder);
     }
 
-    if (!frozen.bypass_local_probe)
-    {
-        frozen.sampled_hits += hits;
-        frozen.sampled_rows += row_end - row_begin;
-        if (frozen.sampled_rows >= adaptive_bypass_sample_rows
-            && frozen.sampled_hits * adaptive_bypass_hit_rate_inverse < frozen.sampled_rows)
-        {
-            frozen.bypass_local_probe = true;
-            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationProbeBypasses);
-        }
-    }
+    updateProbeBypass(frozen, hits, row_end - row_begin);
 
     stageDelayedRecords<typename SharedMethod::Key>(
         columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/false);
@@ -195,19 +191,6 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     /// The kernel runs only while the producer is frozen, and phase transitions happen between
     /// blocks, so the reference stays valid for the whole block.
     auto & frozen = std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase);
-    auto update_bypass_sampling = [&](size_t hits, size_t rows)
-    {
-        if (frozen.bypass_local_probe)
-            return;
-        frozen.sampled_hits += hits;
-        frozen.sampled_rows += rows;
-        if (frozen.sampled_rows >= adaptive_bypass_sample_rows
-            && frozen.sampled_hits * adaptive_bypass_hit_rate_inverse < frozen.sampled_rows)
-        {
-            frozen.bypass_local_probe = true;
-            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationProbeBypasses);
-        }
-    };
     const bool bypass_local_probe = frozen.bypass_local_probe;
 
     if (all_keys_are_const)
@@ -247,21 +230,14 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 
             if (is_simple_count)
             {
-                adaptive.converter.miss_hashes.push_back(hash);
-                adaptive.converter.miss_multiplicities.push_back(static_cast<UInt32>(row_end - row_begin));
-                if constexpr (adaptive_key_stages_bytes<typename SharedMethod::Key>)
-                    adaptive.converter.miss_key_sizes.push_back(adaptiveStagedKeyBytes(key).size());
-                adaptive.converter.miss_buckets.push_back(bucket);
+                adaptive.converter.recordCountRun<typename SharedMethod::Key>(
+                    static_cast<UInt32>(row_begin), hash, bucket, key, static_cast<UInt32>(row_end - row_begin));
             }
             else
             {
                 for (size_t i = row_begin; i < row_end; ++i)
                 {
-                    adaptive.converter.miss_source_rows.push_back(static_cast<UInt32>(i));
-                    adaptive.converter.miss_hashes.push_back(hash);
-                    adaptive.converter.miss_buckets.push_back(bucket);
-                    if constexpr (adaptive_key_stages_bytes<typename SharedMethod::Key>)
-                        adaptive.converter.miss_key_sizes.push_back(adaptiveStagedKeyBytes(key).size());
+                    adaptive.converter.recordMiss<typename SharedMethod::Key>(static_cast<UInt32>(i), hash, bucket, key);
                 }
             }
             stageDelayedRecords<typename SharedMethod::Key>(
@@ -295,7 +271,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 
             const typename SharedMethod::Key staged_key = key;
 
-            bool run_continues = !adaptive.converter.miss_hashes.empty() && adaptive.converter.miss_hashes.back() == hash;
+            bool run_continues = adaptive.converter.lastCountRunHasHash(hash);
             if constexpr (std::is_same_v<typename SharedMethod::Key, std::string_view>)
                 run_continues = run_continues && stable_key_views && staged_key == last_staged_key;
             else
@@ -303,16 +279,12 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 
             if (run_continues)
             {
-                ++adaptive.converter.miss_multiplicities.back();
+                adaptive.converter.extendLastCountRun();
             }
             else
             {
-                adaptive.converter.miss_hashes.push_back(hash);
-                adaptive.converter.miss_multiplicities.push_back(1);
-                /// Fixed-size keys stage no size: it is a compile-time constant the publish
-                /// substitutes, so the hot staging loop skips a dead store per record.
-                if constexpr (adaptive_key_stages_bytes<typename SharedMethod::Key>)
-                    adaptive.converter.miss_key_sizes.push_back(adaptiveStagedKeyBytes(staged_key).size());
+                adaptive.converter.recordCountRun<typename SharedMethod::Key>(
+                    static_cast<UInt32>(i), hash, static_cast<UInt8>(SharedMethod::Data::getBucketFromHash(hash)), staged_key, 1);
 
                 /// A serialized key view points into the reused scratch arena and can only seed
                 /// the run tracking when the views are block-stable; every other key type is
@@ -327,12 +299,10 @@ void NO_INLINE Aggregator::executeFrozenImpl(
                 {
                     last_staged_key = staged_key;
                 }
-                adaptive.converter.miss_source_rows.push_back(static_cast<UInt32>(i));
-                adaptive.converter.miss_buckets.push_back(static_cast<UInt8>(SharedMethod::Data::getBucketFromHash(hash)));
             }
             keyHolderDiscardKey(key_holder);
         }
-        update_bypass_sampling(hits, row_end - row_begin);
+        updateProbeBypass(frozen, hits, row_end - row_begin);
         stageDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/true);
         return;
     }
@@ -363,12 +333,8 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 
             if constexpr (record_places)
                 places_data[i] = nullptr;
-            adaptive.converter.miss_source_rows.push_back(static_cast<UInt32>(i));
-            adaptive.converter.miss_hashes.push_back(hash);
-            adaptive.converter.miss_buckets.push_back(static_cast<UInt8>(SharedMethod::Data::getBucketFromHash(hash)));
-
-            if constexpr (adaptive_key_stages_bytes<typename SharedMethod::Key>)
-                adaptive.converter.miss_key_sizes.push_back(adaptiveStagedKeyBytes(key).size());
+            adaptive.converter.recordMiss<typename SharedMethod::Key>(
+                static_cast<UInt32>(i), hash, static_cast<UInt8>(SharedMethod::Data::getBucketFromHash(hash)), key);
             keyHolderDiscardKey(key_holder);
         }
         return hits;
@@ -377,7 +343,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     if (params.aggregates_size == 0)
     {
         const size_t hits = probe_rows.template operator()<false>(nullptr);
-        update_bypass_sampling(hits, row_end - row_begin);
+        updateProbeBypass(frozen, hits, row_end - row_begin);
         stageDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/false);
         return;
     }
@@ -392,7 +358,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     std::unique_ptr<AggregateDataPtr[], decltype(places_deleter)> places(allocator.allocate(places_size), places_deleter);
 
     const size_t hits = probe_rows.template operator()<true>(places.get());
-    update_bypass_sampling(hits, row_end - row_begin);
+    updateProbeBypass(frozen, hits, row_end - row_begin);
     stageDelayedRecords<typename SharedMethod::Key>(columns, row_end, adaptive, ready_chunks, local_find_state, scratch_pool, /*counts_only=*/false);
 
     /// With no local hits every place is null and the batch pass would only skip rows; the
@@ -421,7 +387,7 @@ void NO_INLINE Aggregator::stageDelayedRecords(
     bool counts_only,
     std::optional<UInt32> key_row_override) const
 {
-    const size_t total = adaptive.converter.miss_hashes.size();
+    const size_t total = adaptive.converter.getRecordedHashes().size();
     if (!total)
         return;
 
@@ -434,12 +400,7 @@ void NO_INLINE Aggregator::stageDelayedRecords(
         columns, aggregates_positions, local_find_state, scratch_pool, counts_only, key_row_override);
     auto & keys = block->keys;
 
-    size_t batch_bytes = 0;
-    if constexpr (adaptive_key_stages_bytes<SharedKey>)
-        for (const auto size : adaptive.converter.miss_key_sizes)
-            batch_bytes += size;
-    else
-        batch_bytes = total * sizeof(SharedKey);
+    size_t batch_bytes = adaptive.converter.getRecordedKeyBytes<SharedKey>();
 
     if (counts_only)
         batch_bytes += total * sizeof(UInt32);
@@ -449,7 +410,7 @@ void NO_INLINE Aggregator::stageDelayedRecords(
                 batch_bytes += column->byteSize();
     batch_bytes += total * (sizeof(UInt64) + (adaptive_key_stages_bytes<SharedKey> ? sizeof(UInt64) : 0));
 
-    observeAdaptiveStagedRecords(shared, adaptive.converter.miss_hashes, batch_bytes);
+    observeAdaptiveStagedRecords(shared, adaptive.converter.getRecordedHashes(), batch_bytes);
 
     adaptive.converter.clearMisses();
 

@@ -107,10 +107,10 @@ struct AdaptiveAggregationSession
         /// Its records are still outstanding, so only the registration is repeated.
         void requeue(const StagedChunkPtr & chunk) { registerChunk(chunk); }
 
-        /// Claims every enqueued chunk and drops the per-bucket registrations at once: each
-        /// chunk is then owned by the returned list alone, so it frees the moment its drain
-        /// completes and memory comes back chunk by chunk. Whatever producers publish after
-        /// the swap waits for the next sweep or for the merge.
+        /// Claims every enqueued chunk once and removes its per-bucket registrations atomically.
+        /// The returned references keep chunks alive through draining; admission envelopes may
+        /// also retain them until admission finishes. Chunks published after the collection
+        /// wait for the next sweep or for the merge.
         std::vector<StagedChunkPtr> takeAllForPressureDrain();
 
         /// The bucket's remaining chunks, read without the mutex: production is over by the
@@ -290,9 +290,8 @@ struct AdaptiveAggregationSession
     std::atomic<bool> thaw_all{false};
 };
 
-/// Per-transform context of the adaptive aggregation: the thread's lifecycle phase and its
-/// phase-owned counters, per-block staging for the missed rows (the arrays are cleared but
-/// keep their capacity across blocks), and the buffered chunks awaiting coalescing.
+/// Holds a transform's adaptive phase and its counters. Its converter records misses and
+/// buffers owned chunks; phase transitions leave that buffered work available for flushing.
 struct AdaptiveAggregationProducer
 {
     explicit AdaptiveAggregationProducer(AdaptiveAggregationSessionPtr shared_) : session(std::move(shared_)) { }
@@ -348,6 +347,9 @@ struct AdaptiveAggregationProducer
 
 struct StagedChunkPreparation
 {
+private:
+    friend class Aggregator;
+
     Aggregator::AggregateColumns aggregate_columns;
     Aggregator::NestedColumnsHolder nested_columns_holder;
     Aggregator::AggregateFunctionInstructions instructions;

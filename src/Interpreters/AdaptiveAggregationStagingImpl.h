@@ -19,18 +19,8 @@ namespace ProfileEvents
     extern const Event AdaptiveAggregationSealNormalizations;
 }
 
-namespace
+namespace DB::AdaptiveStagingDetail
 {
-    using DB::adaptive_key_stages_bytes;
-
-    template <typename Key>
-    ALWAYS_INLINE std::string_view adaptiveStagedKeyBytes(const Key & key)
-    {
-        if constexpr (std::is_same_v<Key, PackedStringRef>)
-            return static_cast<std::string_view>(key);
-        else
-            return key;
-    }
 
     /// How far past a key's bytes a reader may touch. The overflow-tolerant small copy and
     /// compare primitives access up to 15 bytes past the end, which is only legal for bytes
@@ -55,7 +45,7 @@ namespace
     /// skip the holder entirely; fixed-size keys are copied into a local first. The padding
     /// in the ref tells the callback which comparison and copy primitives are legal.
     template <typename SharedKey, typename State, typename Callback>
-    void ALWAYS_INLINE withStagedKeyBytes(State & state, size_t row, size_t size, DB::Arena & scratch, Callback && callback)
+    void ALWAYS_INLINE withStagedKeyBytes(State & state, size_t row, size_t size, Arena & scratch, Callback && callback)
     {
         /// The fast path requires buffers indexed by the block row directly; the low-cardinality
         /// wrapper inherits `chars`/`offsets` bound to its dictionary (rows go through
@@ -69,7 +59,7 @@ namespace
         else if constexpr (adaptive_key_stages_bytes<SharedKey>)
         {
             auto && key_holder = state.getKeyHolder(row, scratch);
-            callback(KeyBytesRef{adaptiveStagedKeyBytes(keyHolderGetKey(key_holder)), ReadablePadding::Exact});
+            callback(KeyBytesRef{static_cast<std::string_view>(keyHolderGetKey(key_holder)), ReadablePadding::Exact});
             keyHolderDiscardKey(key_holder);
         }
         else
@@ -84,7 +74,7 @@ namespace
     /// Compare a staged key (always in a padded container) with candidate bytes of the same
     /// size. The overflow-tolerant primitive reads past both ends, so it is gated on the
     /// candidate's padding; small keys are where it beats a libc call.
-    bool ALWAYS_INLINE stagedKeyEquals(const char * staged, const KeyBytesRef & key)
+    inline bool ALWAYS_INLINE stagedKeyEquals(const char * staged, const KeyBytesRef & key)
     {
         if (key.padding == ReadablePadding::AtLeast15Bytes && key.bytes.size() <= 64)
             return memequalSmallAllowOverflow15(staged, key.bytes.size(), key.bytes.data(), key.bytes.size());
@@ -95,7 +85,7 @@ namespace
     /// overflow-tolerant branch also writes up to 15 bytes past the destination, so the callers
     /// must append in increasing byte order (the scribble lands in space the next append
     /// overwrites); a caller that scatters must use a plain bounded copy instead.
-    void ALWAYS_INLINE copyStagedKeyBytes(char * staged, const KeyBytesRef & key)
+    inline void ALWAYS_INLINE copyStagedKeyBytes(char * staged, const KeyBytesRef & key)
     {
         if (key.bytes.empty())
             return;
@@ -115,9 +105,9 @@ namespace
     /// exceed 32 bits is skipped, because a later survivor of the same key (from a previous
     /// overflow split) may still have capacity, and otherwise the record starts a fresh
     /// survivor of the same key.
-    void ALWAYS_INLINE mergeOrAppendStagedCount(
-        DB::StagedChunk::StagedKeys & keys,
-        DB::PaddedPODArray<UInt32> & multiplicities,
+    inline void ALWAYS_INLINE mergeOrAppendStagedCount(
+        StagedChunk::StagedKeys & keys,
+        PaddedPODArray<UInt32> & multiplicities,
         const UInt64 hash,
         const KeyBytesRef & key,
         const UInt32 multiplicity,
@@ -162,8 +152,39 @@ namespace
 namespace DB
 {
 
+template <typename Key>
+void ALWAYS_INLINE StagedChunkConverter::recordMiss(UInt32 row, UInt64 hash, UInt8 bucket, const Key & key)
+{
+    miss_source_rows.push_back(row);
+    miss_hashes.push_back(hash);
+    miss_buckets.push_back(bucket);
+    if constexpr (adaptive_key_stages_bytes<Key>)
+        miss_key_sizes.push_back(static_cast<std::string_view>(key).size());
+}
+
+template <typename Key>
+void ALWAYS_INLINE StagedChunkConverter::recordCountRun(UInt32 row, UInt64 hash, UInt8 bucket, const Key & key, UInt32 multiplicity)
+{
+    recordMiss(row, hash, bucket, key);
+    miss_multiplicities.push_back(multiplicity);
+}
+
+template <typename Key>
+size_t StagedChunkConverter::getRecordedKeyBytes() const
+{
+    if constexpr (adaptive_key_stages_bytes<Key>)
+    {
+        size_t bytes = 0;
+        for (const auto size : miss_key_sizes)
+            bytes += size;
+        return bytes;
+    }
+    else
+        return miss_hashes.size() * sizeof(Key);
+}
+
 template <typename SharedKey, typename State>
-void NO_INLINE StagedChunkConverter::buildDeduplicatedCountChunk(
+void NO_INLINE StagedChunkConverter::buildCountChunk(
     StagedChunk & block,
     State & local_find_state,
     Arena & scratch_pool,
@@ -207,12 +228,7 @@ void NO_INLINE StagedChunkConverter::buildDeduplicatedCountChunk(
 
     /// Fixed-size keys stage no per-record size (see the kernels); conversion substitutes the
     /// compile-time constant.
-    UInt64 total_bytes = 0;
-    if constexpr (adaptive_key_stages_bytes<SharedKey>)
-        for (const auto size : miss_key_sizes)
-            total_bytes += size;
-    else
-        total_bytes = total * sizeof(SharedKey);
+    const size_t total_bytes = getRecordedKeyBytes<SharedKey>();
 
     auto & keys = block.keys;
     auto & multiplicities = block.payload.emplace<StagedChunk::CountPayload>().multiplicities;
@@ -254,14 +270,14 @@ void NO_INLINE StagedChunkConverter::buildDeduplicatedCountChunk(
             /// re-compute its content hash per record, and the staged arrays already hold both.
             /// All byte uses happen inside the holder's lifetime (see `withStagedKeyBytes`).
             /// A bypassed pass hands the append an empty candidate range, so nothing is scanned.
-            withStagedKeyBytes<SharedKey>(
+            AdaptiveStagingDetail::withStagedKeyBytes<SharedKey>(
                 local_find_state,
                 key_row,
                 size,
                 scratch_pool,
-                [&](const KeyBytesRef & key)
+                [&](const AdaptiveStagingDetail::KeyBytesRef & key)
                 {
-                    mergeOrAppendStagedCount(
+                    AdaptiveStagingDetail::mergeOrAppendStagedCount(
                         keys, multiplicities, hash, key, miss_multiplicities[idx], dedup ? group_out_begin : out, out, byte_pos);
                 });
         }
@@ -283,7 +299,7 @@ void NO_INLINE StagedChunkConverter::buildDeduplicatedCountChunk(
 }
 
 template <typename SharedKey, typename State>
-void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
+void NO_INLINE StagedChunkConverter::buildAggregateChunk(
     StagedChunk & block,
     const Columns & columns,
     const ColumnNumbersList & aggregates_positions,
@@ -378,12 +394,12 @@ void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
         /// overflow-tolerant write could overwrite neighbors already in place. Empty packed
         /// keys have a null data pointer, which `memcpy` does not accept.
         const size_t key_row = key_row_override ? *key_row_override : miss_source_rows[i];
-        withStagedKeyBytes<SharedKey>(
+        AdaptiveStagingDetail::withStagedKeyBytes<SharedKey>(
             local_find_state,
             key_row,
             size,
             scratch_pool,
-            [&](const KeyBytesRef & key)
+            [&](const AdaptiveStagingDetail::KeyBytesRef & key)
             {
                 if (!key.bytes.empty())
                     memcpy(keys.key_bytes.data() + byte_pos, key.bytes.data(), key.bytes.size());
@@ -404,8 +420,8 @@ void NO_INLINE StagedChunkConverter::buildBucketGroupedAggregateChunk(
             /// exactly what will be drained: the thaw estimate and the pinned memory
             /// accounting measure the real payload, instruction preparation wires the
             /// columns directly instead of pinning a second, dense copy next to the wrapper,
-            /// and a gathered `LowCardinality` no longer holds the source block's dictionary
-            /// alive until the merge.
+            /// and gathered `LowCardinality` values own their storage independently of the
+            /// source block's dictionary.
             ColumnPtr gathered = isColumnConst(*columns[position])
                 ? columns[position]->cloneResized(total)
                 : columns[position]->index(*gather_indexes, 0);
@@ -425,11 +441,15 @@ MutableStagedChunkPtr StagedChunkConverter::build(
     bool counts_only,
     std::optional<UInt32> key_row_override)
 {
+    const size_t records = miss_hashes.size();
+    chassert(miss_source_rows.size() == records && miss_buckets.size() == records);
+    chassert(miss_key_sizes.size() == (adaptive_key_stages_bytes<SharedKey> ? records : 0));
+    chassert(miss_multiplicities.size() == (counts_only ? records : 0));
     auto chunk = std::make_shared<StagedChunk>();
     if (counts_only)
-        buildDeduplicatedCountChunk<SharedKey>(*chunk, local_find_state, scratch_pool, key_row_override);
+        buildCountChunk<SharedKey>(*chunk, local_find_state, scratch_pool, key_row_override);
     else
-        buildBucketGroupedAggregateChunk<SharedKey>(
+        buildAggregateChunk<SharedKey>(
             *chunk, columns, aggregates_positions, local_find_state, scratch_pool, key_row_override);
     return chunk;
 }

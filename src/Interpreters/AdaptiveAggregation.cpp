@@ -95,8 +95,8 @@ void Aggregator::prepareStagedChunks(
 {
     chassert(block->isWellFormed());
 
-    /// The drains claim chunks whole, so a chunk is never let into the backlogs larger than
-    /// the part its claim is bounded by (see `splitStagedChunkAtPartBound`).
+    /// Size chunks for the pressure drain before preparing instructions, which borrow their columns.
+    /// Splitting preserves each record whole, even when one record exceeds the part estimate.
     auto pieces = splitStagedChunkAtPartBound(shared, *block);
     if (pieces.empty())
     {
@@ -187,17 +187,11 @@ void Aggregator::retireAdaptiveMergedBucket(AggregatedDataVariants & dest, Adapt
 /// sampled occurrences divided by distinct hashes estimates its repetition count. The verdict is
 /// `(repeat - 1) * bytes_per_record > adaptive_thaw_wasted_bytes_per_key` after enough evidence.
 ///
-/// The caller supplies hashes and bytes for the same records before count deduplication, so the
-/// ratio measures the stream presented to staging. Key bytes, routing metadata, count multiplicities,
-/// and variable-width argument values contribute to the estimate. Repeated variable-width arguments
-/// incur gathering and state-copying costs; fixed-width arguments use the same batch executor as
-/// ordinary aggregation and are excluded from the thaw estimate.
-///
 /// Sampling precedes the mutex; updating the accumulated evidence and deciding the verdict are
 /// serialized. A producer observes `thaw_all` before freezing or at its next post-block check. Records
 /// already deferred by a frozen kernel must still reach the drain, regardless of the verdict.
 void Aggregator::observeAdaptiveStagedRecords(
-    AdaptiveAggregationSession & shared, const PaddedPODArray<UInt64> & hashes, size_t batch_bytes) const
+    AdaptiveAggregationSession & shared, std::span<const UInt64> hashes, size_t batch_bytes) const
 {
     if (!shared.thaw_all.load(std::memory_order_relaxed))
     {

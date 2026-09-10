@@ -289,7 +289,7 @@ MutableStagedChunkPtr StagedChunkConverter::flush()
     static const auto log = getLogger("Aggregator");
     LOG_TRACE(
         log,
-        "Adaptive aggregation: sealed {} staged batches into one chunk of {} records",
+        "Adaptive aggregation: coalesced {} staged batches into one chunk of {} records",
         num_minis,
         keys.size());
 
@@ -380,8 +380,9 @@ void StagedChunkConverter::coalesceCountChunksWithDeduplication(
                 const auto & mini = *minis[ref.mini];
 
                 /// Batch key bytes live in the minis' padded staged arrays.
-                const KeyBytesRef key{mini.keys.keyBytesAt(ref.index), ReadablePadding::AtLeast15Bytes};
-                mergeOrAppendStagedCount(
+                const AdaptiveStagingDetail::KeyBytesRef key{
+                    mini.keys.keyBytesAt(ref.index), AdaptiveStagingDetail::ReadablePadding::AtLeast15Bytes};
+                AdaptiveStagingDetail::mergeOrAppendStagedCount(
                     keys, multiplicities, ref.hash, key, multiplicities_of(mini)[ref.index], group_out_begin, out, byte_pos);
             }
         }

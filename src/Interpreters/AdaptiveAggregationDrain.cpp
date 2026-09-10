@@ -307,14 +307,12 @@ void NO_INLINE Aggregator::drainAdaptiveBucketImpl(
 
     const auto & prep = *std::get<StagedChunk::AggregatePayload>(block.payload).prepared;
 
-    /// The consume path's compiled aggregation applies here under the same gate: unlike the
-    /// frozen consume loop, whose misses are null places the compiled row loop cannot skip,
-    /// every place in a drain slice is non-null, and the staged argument columns are always
-    /// dense. The sparse check only mirrors the consume-path gate - a prepared staged chunk
-    /// cannot carry sparse arguments.
+    /// Conversion materializes staged arguments, and the drain assigns a state to every record.
+    /// These dense columns and non-null places can use the compiled aggregate functions directly.
+    chassert(!hasSparseArguments(prep.instructions.data()));
     bool use_compiled_functions = false;
 #if USE_EMBEDDED_COMPILER
-    use_compiled_functions = compiled_aggregate_functions_holder && !hasSparseArguments(prep.instructions.data());
+    use_compiled_functions = compiled_aggregate_functions_holder != nullptr;
 #endif
 
     /// `places` is indexed by absolute record index: the compacted argument columns hold record

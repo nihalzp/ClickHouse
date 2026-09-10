@@ -2,6 +2,7 @@
 
 #include <array>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <type_traits>
 #include <variant>
@@ -84,15 +85,15 @@ struct StagedChunk
     /// row i of `argument_columns`, which hold the records' values gathered during conversion in the
     /// same bucket-grouped order, so a bucket's slice is a contiguous row range. Only the
     /// aggregate-argument positions are filled, kept at their original indexes so that the
-    /// instruction preparation can index the vector; sparse arguments are materialized by the
-    /// gather, so the staged columns are always dense.
+    /// instruction preparation can index the vector. Conversion gathers the rows before
+    /// materializing wrapped arguments, so the staged columns are always dense.
     struct AggregatePayload
     {
         Columns argument_columns;
 
-        /// The aggregate-function instructions over `argument_columns`, built in the chunk's
-        /// own stable storage when the chunk is published (see `prepareStagedChunk`), so a
-        /// published chunk is immutable and the drains read it without coordination.
+        /// Instructions over `argument_columns`, built by `prepareStagedChunk` after coalescing
+        /// and splitting. Preparation is owned by this chunk and stays immutable during admission
+        /// and draining, so bucket workers can read it concurrently.
         std::unique_ptr<const StagedChunkPreparation> prepared;
 
         AggregatePayload();
@@ -116,22 +117,43 @@ struct StagedChunk
     /// must be prepared for the returned columns before admission.
     MutableStagedChunkPtr cut(size_t start, size_t length) const;
 
-    /// Debug-only structural invariants, checked before admission.
+    /// Returns whether key ranges and payload lengths describe the same records.
     bool isWellFormed() const;
 };
 
-/// Converts recorded frozen-table misses into owned, bucket-grouped chunks. The producer
-/// supplies aggregation metadata when building a candidate. Buffering and coalescing use the
-/// candidate's owned payload; the producer prepares returned chunks for admission.
+/// Records frozen-table misses and converts them into owned, bucket-grouped chunks, then buffers
+/// and coalesces small chunks. The producer observes recorded hashes for thaw decisions and prepares
+/// returned chunks for admission. The converter owns record layout and copying, not adaptive policy.
 class StagedChunkConverter
 {
 public:
-    /// The current block's misses, one entry per delayed record, in staging order.
-    PaddedPODArray<UInt32> miss_source_rows;
-    PaddedPODArray<UInt64> miss_hashes;
-    PaddedPODArray<UInt8> miss_buckets;
-    PaddedPODArray<UInt64> miss_key_sizes;
-    PaddedPODArray<UInt32> miss_multiplicities;
+    /// Records a source row and its routing information. Variable-width keys also record their byte size.
+    template <typename Key>
+    void recordMiss(UInt32 row, UInt64 hash, UInt8 bucket, const Key & key);
+
+    /// Records one count contribution, represented by its first source row and run length.
+    template <typename Key>
+    void recordCountRun(UInt32 row, UInt64 hash, UInt8 bucket, const Key & key, UInt32 multiplicity);
+
+    /// Tests the hash of the last recorded count run. The caller must also compare the keys.
+    bool lastCountRunHasHash(UInt64 hash) const
+    {
+        return !miss_hashes.empty() && miss_hashes.back() == hash;
+    }
+
+    /// Extends the count run after the caller has established key equality.
+    void extendLastCountRun()
+    {
+        chassert(!miss_multiplicities.empty());
+        ++miss_multiplicities.back();
+    }
+
+    /// Exposes the pre-deduplication hashes for the producer's thaw sample, until `clearMisses`.
+    std::span<const UInt64> getRecordedHashes() const { return {miss_hashes.data(), miss_hashes.size()}; }
+
+    /// Returns the key bytes represented by those hashes, before chunk deduplication.
+    template <typename Key>
+    size_t getRecordedKeyBytes() const;
 
     /// Builds a candidate without clearing misses, which the producer still needs for thaw sampling.
     template <typename SharedKey, typename State>
@@ -143,21 +165,31 @@ public:
         bool counts_only,
         std::optional<UInt32> key_row_override);
 
-    /// Returns a large candidate immediately, or coalesces buffered candidates once their byte target is reached.
+    /// Returns a candidate of at least half the byte target directly, leaving buffered chunks pending.
+    /// Smaller candidates are buffered and coalesced when their combined bytes reach the target;
+    /// returns null while they remain buffered.
     MutableStagedChunkPtr stage(MutableStagedChunkPtr chunk);
 
     /// Returns the coalesced pending candidates, or null when there are none.
     MutableStagedChunkPtr flush();
 
+    /// Clears all recorded fields together after observation, retaining their capacity for the next block.
     void clearMisses();
 
 private:
+    /// The current block's misses, one entry per delayed record, in staging order.
+    PaddedPODArray<UInt32> miss_source_rows;
+    PaddedPODArray<UInt64> miss_hashes;
+    PaddedPODArray<UInt8> miss_buckets;
+    PaddedPODArray<UInt64> miss_key_sizes;
+    PaddedPODArray<UInt32> miss_multiplicities;
+
     template <typename SharedKey, typename State>
-    void buildDeduplicatedCountChunk(
+    void buildCountChunk(
         StagedChunk & block, State & local_find_state, Arena & scratch_pool, std::optional<UInt32> key_row_override);
 
     template <typename SharedKey, typename State>
-    void buildBucketGroupedAggregateChunk(
+    void buildAggregateChunk(
         StagedChunk & block, const Columns & columns, const ColumnNumbersList & aggregates_positions,
         State & local_find_state, Arena & scratch_pool, std::optional<UInt32> key_row_override);
 
