@@ -1,5 +1,4 @@
 #include <Processors/Transforms/AdaptiveAggregationMergeTransform.h>
-#include <Processors/QueryPlan/AggregatingStep.h>
 #include <Interpreters/AdaptiveAggregationImpl.h>
 
 namespace DB
@@ -104,7 +103,7 @@ IProcessor::PipelineUpdate AdaptiveAggregationMergeTransform::updatePipeline()
     connect(output, inputs.back());
     stage = Stage::ReadingMerge;
     for (auto & processor : processors)
-        processor->inheritQueryPlanStepFromParent(*this, static_cast<size_t>(AggregatingStep::AggregatingStage::FinalAggregation));
+        processor->inheritQueryPlanStepFromParent(*this, getQueryPlanStepGroup());
     return PipelineUpdate{.to_add = std::move(processors), .to_remove = {}};
 }
 

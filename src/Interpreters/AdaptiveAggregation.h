@@ -15,8 +15,8 @@ namespace DB
 /// keeps aggregating in place with zero coordination, while a miss (a rare key) is not inserted
 /// anywhere: it becomes a delayed record in one of the 256 backlogs, chosen by the two-level
 /// bucket of the key's hash. A record is the key value itself with a run-length count when the
-/// only aggregate is count, and otherwise the key plus its row's aggregate-argument values,
-/// gathered into dense per-block columns at publish so the source block is released; both
+/// only aggregate is `count`, and otherwise the key plus its row's aggregate-argument values,
+/// gathered into owned dense columns during conversion; both
 /// carry the precomputed routing hash. Nothing is drained while production runs unless memory
 /// demands it: past the external-aggregation threshold a pressure sweep drains the backlogs
 /// early into the shared routing table and, if that is not enough, spills the routing table
@@ -51,20 +51,20 @@ namespace DB
 struct AdaptiveAggregationSession;
 using AdaptiveAggregationSessionPtr = std::shared_ptr<AdaptiveAggregationSession>;
 
-/// Per-transform context of the adaptive aggregation: the thread's lifecycle phase, per-block
-/// staging for the missed rows, and the buffered chunks awaiting coalescing.
+/// Per-transform adaptive phase and its counters, with a converter for recording misses and
+/// buffering owned chunks until they are ready for admission.
 struct AdaptiveAggregationProducer;
 
-/// Producer-owned transport and suspended post-block work.
+/// Suspended aggregation state and its outbox, owned by the aggregating processor.
 struct AdaptiveAggregationExecution;
 
 /// Owned delayed records grouped by bucket. A chunk can combine records from multiple input
-/// blocks. A published chunk is immutable; only the producer building it holds it mutably.
+/// blocks. A chunk becomes immutable after preparation, before it enters the admission port.
 struct StagedChunk;
 using StagedChunkPtr = std::shared_ptr<const StagedChunk>;
 using MutableStagedChunkPtr = std::shared_ptr<StagedChunk>;
 
-/// A published chunk's shared aggregate-instruction preparation (see `prepareStagedChunk`).
+/// A chunk's owned aggregate-instruction preparation, built by `prepareStagedChunk` before admission.
 struct StagedChunkPreparation;
 
 /// Who owns a staged key once it is emplaced into a table: the merge-time drain borrows the

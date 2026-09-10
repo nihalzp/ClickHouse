@@ -37,8 +37,8 @@ IProcessor::Status AdaptiveAggregationAdmissionTransform::prepare()
         return Status::Finished;
     }
 
-    /// Completion carries no data and needs no output demand. Do not renew input demand while
-    /// a pulled chunk is waiting for work: the producer uses that demand as its acknowledgement.
+    /// Renewed demand acknowledges registration and release of the previous envelope in `work`.
+    /// Completion carries no data and needs no output demand.
     input.setNeeded();
     if (!input.hasData())
         return Status::NeedData;

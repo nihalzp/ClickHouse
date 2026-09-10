@@ -704,6 +704,10 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
         std::shared_ptr<AdaptiveAggregationMergeTransform> adaptive_merge;
         if (use_adaptive_aggregator)
         {
+            /// Each producer must connect directly to its own admission transform. Renewed port demand
+            /// acknowledges registration and release of the envelope before the producer resumes memory
+            /// checks or finishes. An intervening buffer or resize would break that acknowledgement.
+            /// Registration runs independently per producer; the merge receives only stream completion.
             pipeline.addSimpleTransform(
                 [&](const SharedHeader & header)
                 {
@@ -717,9 +721,10 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
         pipeline.resize(streams_after_aggregation, false, settings.min_outstreams_per_resize_after_split);
 
         aggregating = collector.detachProcessors(static_cast<size_t>(AggregatingStage::PartialAggregation));
+        /// The collector assigns the producer group to all processors; the merge and its children
+        /// belong to final aggregation.
         if (adaptive_merge)
             adaptive_merge->setQueryPlanStepGroup(static_cast<size_t>(AggregatingStage::FinalAggregation));
-
     }
     else
     {

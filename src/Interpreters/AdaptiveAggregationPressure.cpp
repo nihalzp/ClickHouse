@@ -116,11 +116,10 @@ static Int64 currentThreadTrackedMemory()
 {
     if (!CurrentThread::isInitialized())
         return 0;
-    CurrentThread::get().flushUntrackedMemory();
-    const auto * tracker = CurrentThread::getMemoryTracker();
-    if (!tracker || tracker->level != VariableContext::Thread)
-        return 0;
-    return tracker->get();
+    auto & thread = CurrentThread::get();
+    thread.flushUntrackedMemory();
+    chassert(thread.memory_tracker.level == VariableContext::Thread);
+    return thread.memory_tracker.get();
 }
 
 /// The shared drain table's footprint for the part bound and the detached-bytes budget: the
@@ -143,7 +142,7 @@ static AggregatedDataVariantsPtr detachSharedDrainTable(AdaptiveAggregationSessi
 
 /// The memory a published chunk holds, and keeps holding until the drain that claimed it
 /// returns: the staged keys, and the staged payload beside them - the run lengths of a
-/// count-only chunk, or the argument columns a general-aggregate chunk gathered at publish,
+/// count-only chunk, or the argument columns gathered during conversion,
 /// whose variable-width values can outweigh everything the drained table itself will cost.
 /// Variable-width keys are counted twice, because a pressure-time drain copies them into the
 /// table's arena while the chunk still holds the staged bytes, so both copies are resident when
@@ -186,19 +185,11 @@ static size_t estimateStagedRangeBytesWithKeyCopy(const StagedChunk & chunk, siz
 std::vector<MutableStagedChunkPtr> Aggregator::splitStagedChunkAtPartBound(
     const AdaptiveAggregationSession & shared, const StagedChunk & chunk) const
 {
-    /// The claims of the drains (`drainStagedChunksUnderMemoryPressure`, `drainStagedChunksAtFinish`)
-    /// stop between chunks, so their bound holds at the granularity of a chunk: a batch overshoots
-    /// the part by up to the last chunk it took, and a chunk that is alone over the part would be
-    /// claimed whole, its drain building the over-budget table the bound exists to prevent,
-    /// admitted by the budget as an oversized request that is alone. So a chunk is published at
-    /// no more than half a part, which caps the overshoot at half a part too. The seal keeps
-    /// coalesced chunks at a few megabytes, under half the part floor for ordinary states, so
-    /// only a chunk that carries one consumed block of wide keys or wide arguments, or a large
-    /// block, or records with wide states, comes out over it; such a chunk is cut here into the
-    /// fewest pieces the bound admits: along bucket boundaries where the buckets fit, and record
-    /// by record inside a bucket that is over the bound on its own, which a few records with
-    /// wide arguments routed to one bucket can be. Only a single record over the bound goes out
-    /// as it is: the drain has to hold a record whole.
+    /// Pressure drains claim whole chunks and can exceed their part estimate by the last chunk taken.
+    /// Split each chunk to fit half that estimate, first at bucket boundaries and then within any
+    /// bucket that is too large. A single record stays whole even when it exceeds the estimate.
+    /// Coalescing limits staged bytes. The drain estimate also charges hash-table cells and the
+    /// inline storage of aggregate states.
     const size_t part_bytes = adaptivePressurePartBytes();
     if (part_bytes == std::numeric_limits<size_t>::max())
         return {};

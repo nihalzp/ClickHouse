@@ -5,8 +5,8 @@
 namespace DB
 {
 
-/// Visits nonempty source slices in partition-major, then source order. Offsets are read from
-/// the caller's existing partition index; no per-row permutation or copied offset table is built.
+/// Visits nonempty source slices in partition-major, then source order, reading offsets directly
+/// from the caller's partition index and supplying each slice's destination position.
 template <typename Offsets, typename Visitor>
 void forEachPartitionedChunkRange(size_t num_partitions, size_t num_sources, Offsets && offsets, Visitor && visitor)
 {
