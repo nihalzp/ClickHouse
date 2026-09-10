@@ -898,3 +898,99 @@ TEST(AdaptiveAggregationPipeline, CancellationReleasesQueuedMergeOutput)
         EXPECT_TRUE(session->cancelled.load());
     }
 }
+
+TEST(AdaptiveAggregationPipeline, EmptyAndEarlyFinishedProducersBeforeLateEngagement)
+{
+    MainThreadStatus::getInstance();
+    for (const size_t late_rows : {0, 32, 8192})
+    {
+        for (const bool partial_result : {false, true})
+        {
+            SCOPED_TRACE(late_rows);
+            SCOPED_TRACE(partial_result);
+            auto header = makeHeader();
+            auto params = makeParams(header);
+            auto many_data = std::make_shared<ManyAggregatedData>(3);
+            auto session = std::make_shared<AdaptiveAggregationSession>();
+            many_data->adaptive_session = session;
+            AdaptiveAggregationMergeTransform merge(params, many_data, 2, 2, nullptr);
+            InputPort result(header);
+            connect(merge.getOutputs().front(), result);
+            std::vector<std::unique_ptr<AggregatingTransform>> producers;
+            std::vector<std::unique_ptr<AdaptiveAggregationAdmissionTransform>> admissions;
+            std::vector<std::unique_ptr<OutputPort>> sources;
+            auto completion = merge.getInputs().begin();
+            for (size_t i = 0; i < many_data->num_producers; ++i)
+            {
+                auto producer = std::make_unique<AggregatingTransform>(header, params, many_data, i, 2, 2, false, false, nullptr);
+                auto admission = std::make_unique<AdaptiveAggregationAdmissionTransform>(header, params, session);
+                auto source = std::make_unique<OutputPort>(header);
+                connect(*source, producer->getInputs().front());
+                connect(producer->getOutputs().front(), admission->getInputs().front());
+                connect(admission->getOutputs().front(), *completion++);
+                producers.push_back(std::move(producer));
+                admissions.push_back(std::move(admission));
+                sources.push_back(std::move(source));
+            }
+            ASSERT_EQ(merge.prepare({}, {}), IProcessor::Status::NeedData);
+            completion = merge.getInputs().begin();
+            for (size_t i = 0; i < many_data->num_producers; ++i, ++completion)
+            {
+                auto & producer = *producers[i];
+                auto & admission = *admissions[i];
+                auto & source = *sources[i];
+                ASSERT_FALSE(session->initialized.load());
+                ASSERT_EQ(admission.prepare(), IProcessor::Status::NeedData);
+                ASSERT_EQ(producer.prepare(), IProcessor::Status::NeedData);
+                const size_t rows = i == 0 ? 0 : i == 1 ? std::min<size_t>(32, late_rows) : late_rows;
+                if (rows)
+                {
+                    source.push(keyRange(i == 2 ? 16 : 0, rows));
+                    ASSERT_EQ(producer.prepare(), IProcessor::Status::Ready);
+                    producer.work();
+                    ASSERT_EQ(producer.prepare(), IProcessor::Status::NeedData);
+                }
+                if (partial_result)
+                {
+                    producer.cancel(IProcessor::CancelReason::PartialResult);
+                    admission.cancel(IProcessor::CancelReason::PartialResult);
+                    merge.cancel(IProcessor::CancelReason::PartialResult);
+                }
+                source.finish();
+                ASSERT_EQ(producer.prepare(), IProcessor::Status::Ready);
+                producer.work();
+                if (i == 2 && late_rows == 8192)
+                {
+                    /// The last producer freezes after the others finish. Its buffered rows
+                    /// must be admitted before the coordinator can merge all three tables.
+                    ASSERT_EQ(producer.prepare(), IProcessor::Status::PortFull);
+                    ASSERT_EQ(admission.prepare(), IProcessor::Status::Ready);
+                    admission.work();
+                    ASSERT_EQ(admission.prepare(), IProcessor::Status::NeedData);
+                    ASSERT_EQ(producer.prepare(), IProcessor::Status::Ready);
+                    producer.work();
+                }
+                ASSERT_EQ(producer.prepare(), IProcessor::Status::Finished);
+                ASSERT_EQ(admission.prepare(), IProcessor::Status::Finished);
+                EXPECT_EQ(merge.prepare({&*completion}, {}), i == 2 ? IProcessor::Status::Ready : IProcessor::Status::NeedData);
+            }
+            EXPECT_EQ(session->initialized.load(), late_rows == 8192);
+            EXPECT_FALSE(session->cancelled.load());
+            merge.work();
+            auto update = merge.updatePipeline();
+            auto & output = update.to_add.back()->getOutputs().front();
+            disconnect(output, merge.getInputs().back());
+            auto sink = std::make_shared<KeySink>(header);
+            connect(output, sink->getPort());
+            auto processors = std::make_shared<Processors>(std::move(update.to_add));
+            processors->push_back(sink);
+            PipelineExecutor executor(processors, QueryStatusPtr{});
+            if (partial_result)
+                executor.cancelReading();
+            executor.execute(1, false);
+            const UInt64 expected_rows = late_rows ? 16 + late_rows : 0;
+            EXPECT_EQ(sink->rows, expected_rows);
+            EXPECT_EQ(sink->sum, expected_rows ? expected_rows * (expected_rows - 1) / 2 : 0);
+        }
+    }
+}

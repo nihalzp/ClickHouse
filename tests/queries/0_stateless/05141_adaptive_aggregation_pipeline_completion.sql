@@ -9,24 +9,27 @@ SET collect_hash_table_stats_during_aggregation = 0;
 SET max_bytes_before_external_group_by = 0;
 SET max_bytes_ratio_before_external_group_by = 0;
 
+-- Explicitly wide keys retain a hash-table method eligible for adaptive aggregation.
 -- Empty and never-frozen producers close their admission streams without a staged payload.
-SELECT 'empty', count() FROM (SELECT number AS k, count() FROM numbers_mt(0) GROUP BY k);
+-- Filtering at runtime keeps multiple source streams even though none produces a grouped row.
+SELECT 'empty', count()
+FROM (SELECT number AS k, count() FROM numbers_mt(8192) WHERE cityHash64(number) = 0 GROUP BY k);
 SELECT 'never frozen', count(), sum(c)
-FROM (SELECT number % 8 AS k, count() AS c FROM numbers_mt(1024) GROUP BY k)
+FROM (SELECT toUInt64(number % 8) AS k, count() AS c FROM numbers_mt(8192) GROUP BY k)
 SETTINGS adaptive_aggregator_freeze_threshold = 1000000;
 
 -- Small input blocks leave candidates in the converter until final flushing. Count, general,
 -- and key-only payloads must all reach admission before the final merge starts.
 SELECT 'count final flush', count(), sum(c)
-FROM (SELECT number % 16000 AS k, count() AS c FROM numbers_mt(64000) GROUP BY k);
+FROM (SELECT toUInt64(number % 16000) AS k, count() AS c FROM numbers_mt(64000) GROUP BY k);
 SELECT 'general final flush', count(), sum(c), sum(s), sum(mx - mn)
 FROM
 (
-    SELECT number % 16000 AS k, count() AS c, sum(number) AS s, min(number) AS mn, max(number) AS mx
+    SELECT toUInt64(number % 16000) AS k, count() AS c, sum(number) AS s, min(number) AS mn, max(number) AS mx
     FROM numbers_mt(64000) GROUP BY k
 );
 SELECT 'key-only final flush', count(), sum(k)
-FROM (SELECT number % 16000 AS k FROM numbers_mt(64000) GROUP BY k);
+FROM (SELECT toUInt64(number % 16000) AS k FROM numbers_mt(64000) GROUP BY k);
 
 -- A downstream limit can close the result stream while bucket workers still retain staged keys.
 SELECT 'limited result', count()
