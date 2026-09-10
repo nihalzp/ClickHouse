@@ -28,7 +28,11 @@ IProcessor::Status AdaptiveAggregationMergeTransform::prepare(const UpdatedInput
     {
         session->cancel();
         for (auto & input : inputs)
+        {
             input.close();
+            if (input.hasData())
+                input.pullData(/*set_not_needed=*/true);
+        }
         many_data.reset();
         return Status::Finished;
     }

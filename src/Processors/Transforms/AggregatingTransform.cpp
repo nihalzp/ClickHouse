@@ -139,6 +139,16 @@ namespace
 
         String getName() const override { return "SourceFromNativeStream"; }
 
+        void cancel(CancelReason reason) noexcept override
+        {
+            /// These files contain rows already consumed by aggregation. A partial-result
+            /// request stops external input while the merge drains every stored block.
+            if (reason == CancelReason::PartialResult)
+                return;
+
+            ISource::cancel(reason);
+        }
+
         Chunk generate() override
         {
             if (!reader)
@@ -1246,6 +1256,8 @@ IProcessor::Status AggregatingTransform::prepareAdaptive()
     {
         adaptive_context->session->cancel();
         input.close();
+        if (input.hasData())
+            input.pullData(/*set_not_needed=*/true);
         current_chunk.clear();
         adaptive_context->converter = {};
         adaptive_execution.reset();

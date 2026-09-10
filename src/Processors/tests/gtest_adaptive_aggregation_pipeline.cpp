@@ -23,6 +23,7 @@
 #include <Interpreters/TemporaryDataOnDisk.h>
 #include <Processors/Executors/Runtime/PipelineExecutor.h>
 #include <Processors/ISink.h>
+#include <Processors/Sources/NullSource.h>
 #include <Processors/Sources/SourceFromChunks.h>
 #include <Processors/Transforms/AdaptiveAggregationAdmissionTransform.h>
 #include <Processors/Transforms/AdaptiveAggregationMergeTransform.h>
@@ -760,5 +761,140 @@ TEST(AdaptiveAggregationPipeline, FinalAssemblyIncludesLateSpillsAndReadersOwnTe
         EXPECT_GT(tmp_data->currentCompressedSize(), 0);
         processors.reset();
         EXPECT_EQ(tmp_data->currentCompressedSize(), 0);
+    }
+}
+
+TEST(AdaptiveAggregationPipeline, PartialResultCompletesExistingAndDeferredSpillReaders)
+{
+    MainThreadStatus::getInstance();
+    for (const bool deferred_assembly : {false, true})
+    {
+        SCOPED_TRACE(deferred_assembly);
+        auto disk = createDisk("adaptive_partial_result_spill");
+        SCOPE_EXIT({ destroyDisk(disk); });
+        auto volume = std::make_shared<SingleDiskVolume>("volume", disk);
+        auto tmp_data = std::make_shared<TemporaryDataOnDiskScope>(TemporaryDataOnDiskSettings{}, volume);
+        auto header = makeHeader();
+        auto params = makeParams(header, 0, {}, tmp_data);
+        auto many_data = std::make_shared<ManyAggregatedData>(2);
+        if (deferred_assembly)
+            many_data->adaptive_session = std::make_shared<AdaptiveAggregationSession>();
+        constexpr size_t rows_per_producer = 10000;
+        for (size_t i = 0; i < many_data->num_producers; ++i)
+        {
+            auto chunk = keyRange(i * rows_per_producer, rows_per_producer);
+            auto & variant = *many_data->variants[i];
+            ColumnRawPtrs key_columns(params->params.keys_size);
+            Aggregator::AggregateColumns aggregate_columns(params->params.aggregates_size);
+            bool no_more_keys = false;
+            ASSERT_TRUE(params->aggregator.executeOnBlock(
+                chunk.detachColumns(), 0, rows_per_producer, variant, key_columns, aggregate_columns, no_more_keys, nullptr));
+            variant.convertToTwoLevel();
+            params->aggregator.writeToTemporaryFile(variant);
+        }
+        ASSERT_TRUE(params->aggregator.hasTemporaryData());
+
+        auto processors = std::make_shared<Processors>();
+        if (deferred_assembly)
+        {
+            auto merge = std::make_shared<AdaptiveAggregationMergeTransform>(params, many_data, 2, 2, nullptr);
+            for (auto & input : merge->getInputs())
+            {
+                auto completion = std::make_shared<NullSource>(header);
+                connect(completion->getPort(), input);
+                processors->push_back(completion);
+            }
+            processors->push_back(merge);
+        }
+        else
+        {
+            *processors = createAggregationMergePipeline(params, many_data, 2, 2, false, false, nullptr);
+        }
+        auto sink = std::make_shared<KeySink>(header);
+        connect(processors->back()->getOutputs().front(), sink->getPort());
+        processors->push_back(sink);
+        PipelineExecutor executor(processors, QueryStatusPtr{});
+        /// The request applies to existing readers and to readers the coordinator adds later.
+        /// Both must drain all data already consumed by aggregation.
+        executor.cancelReading();
+        executor.execute(1, false);
+        constexpr UInt64 expected_rows = 2 * rows_per_producer;
+        EXPECT_EQ(sink->rows, expected_rows);
+        EXPECT_EQ(sink->sum, expected_rows * (expected_rows - 1) / 2);
+        if (deferred_assembly)
+            EXPECT_FALSE(many_data->adaptive_session->cancelled.load());
+    }
+}
+
+TEST(AdaptiveAggregationPipeline, CancellationReleasesQueuedAndPulledProducerInput)
+{
+    for (const bool pulled : {false, true})
+    {
+        for (const bool cancelled : {false, true})
+        {
+            SCOPED_TRACE(pulled);
+            SCOPED_TRACE(cancelled);
+            auto header = makeHeader();
+            auto params = makeParams(header);
+            auto many_data = std::make_shared<ManyAggregatedData>(2);
+            auto session = std::make_shared<AdaptiveAggregationSession>();
+            many_data->adaptive_session = session;
+            AggregatingTransform producer(header, params, many_data, 0, 2, 2, false, false, nullptr);
+            OutputPort source(header);
+            InputPort admission(header);
+            connect(source, producer.getInputs().front());
+            connect(producer.getOutputs().front(), admission);
+            admission.setNeeded();
+            ASSERT_EQ(producer.prepare(), IProcessor::Status::NeedData);
+            auto chunk = keyRange(0, 1024);
+            auto owner = chunk.getColumns().front();
+            source.push(std::move(chunk));
+            if (pulled)
+                ASSERT_EQ(producer.prepare(), IProcessor::Status::Ready);
+            if (cancelled)
+                producer.cancel();
+            else
+                admission.close();
+            EXPECT_EQ(producer.prepare(), IProcessor::Status::Finished);
+            EXPECT_EQ(owner->use_count(), 1);
+            EXPECT_FALSE(producer.getInputs().front().hasData());
+            EXPECT_TRUE(source.isFinished());
+            EXPECT_TRUE(session->cancelled.load());
+        }
+    }
+}
+
+TEST(AdaptiveAggregationPipeline, CancellationReleasesQueuedMergeOutput)
+{
+    for (const bool cancelled : {false, true})
+    {
+        SCOPED_TRACE(cancelled);
+        auto header = makeHeader();
+        auto params = makeParams(header);
+        auto many_data = std::make_shared<ManyAggregatedData>(1);
+        auto session = std::make_shared<AdaptiveAggregationSession>();
+        many_data->adaptive_session = session;
+        AdaptiveAggregationMergeTransform merge(params, many_data, 1, 1, nullptr);
+        OutputPort completion(header);
+        InputPort result(header);
+        connect(completion, merge.getInputs().front());
+        connect(merge.getOutputs().front(), result);
+        completion.finish();
+        ASSERT_EQ(merge.prepare({}, {}), IProcessor::Status::Ready);
+        merge.work();
+        auto update = merge.updatePipeline();
+        result.setNeeded();
+        ASSERT_EQ(merge.prepare({}, {}), IProcessor::Status::NeedData);
+        auto chunk = keyRange(0, 1024);
+        auto owner = chunk.getColumns().front();
+        update.to_add.back()->getOutputs().front().push(std::move(chunk));
+        if (cancelled)
+            merge.cancel();
+        else
+            result.close();
+        EXPECT_EQ(merge.prepare({}, {}), IProcessor::Status::Finished);
+        EXPECT_EQ(owner->use_count(), 1);
+        EXPECT_FALSE(merge.getInputs().back().hasData());
+        EXPECT_TRUE(session->cancelled.load());
     }
 }
