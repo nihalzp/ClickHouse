@@ -38,10 +38,11 @@ public:
     PartitionedRecordBuffer(const PartitionedRecordBuffer &) = delete;
     PartitionedRecordBuffer & operator=(const PartitionedRecordBuffer &) = delete;
 
-    /// Appends one record of `bytes` and returns its storage. A record never straddles two chunks, and
+    /// Appends one record of positive `bytes` and returns its storage. A record never straddles two chunks, and
     /// `tail_padding_bytes` of the chunk follow it.
     ALWAYS_INLINE char * append(size_t partition, size_t bytes)
     {
+        chassert(bytes > 0);
         Cursor & cursor = cursors[partition];
         if (cursor.remaining < bytes) [[unlikely]]
             startChunk(partition, bytes);
@@ -65,7 +66,7 @@ public:
     void forEachChunk(size_t partition, Callback && callback) const;
 
     bool hasRecords(size_t partition) const { return chains[partition].first != nullptr; }
-    UInt64 recordsOf(size_t partition) const { return cursors[partition].records; }
+    UInt64 recordsOf(size_t partition) const { return chains[partition].closed_chunk_records + cursors[partition].records; }
 
     /// Releases the partition's chunks and resets its cursor. Consumers may release distinct partitions
     /// concurrently, after `finishAppending`.
@@ -85,8 +86,8 @@ private:
     struct Block;
     struct ChunkHeader;
 
-    /// The fields updated by every append share a compact header. Chunk capacities and record counts
-    /// are 32-bit, so the remaining capacity and record count fit beside the append pointer.
+    /// The fields updated by every append share a compact header. Each chunk's capacity and record count
+    /// fit in 32 bits, so they fit beside the append pointer. The chain holds the count of earlier chunks.
     struct Cursor
     {
         char * pos = nullptr;
@@ -99,6 +100,7 @@ private:
     {
         ChunkHeader * first = nullptr;
         ChunkHeader * last = nullptr;
+        UInt64 closed_chunk_records = 0;
     };
 
     /// The position and remaining capacity in one allocation group's current block.

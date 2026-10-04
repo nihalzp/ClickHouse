@@ -110,3 +110,25 @@ TEST(PartitionedRecordBuffer, ConcurrentPartitionRelease)
     for (size_t partition = 0; partition < partitions; ++partition)
         EXPECT_FALSE(buffer.hasRecords(partition));
 }
+
+TEST(PartitionedRecordBuffer, RecordCountsWhileAppending)
+{
+    PartitionedRecordBuffer buffer(1, 1);
+    const std::string record(2001, 'x');
+    for (size_t row = 0; row < 300; ++row)
+    {
+        appendRecord(buffer, 0, record);
+        EXPECT_EQ(buffer.recordsOf(0), row + 1);
+    }
+
+    /// Finishing publishes the last chunk's bytes without changing the partition's record count.
+    buffer.finishAppending();
+    buffer.finishAppending();
+    EXPECT_EQ(buffer.recordsOf(0), 300);
+
+    appendRecord(buffer, 0, std::string(40001, 'y'));
+    buffer.finishAppending();
+    EXPECT_EQ(buffer.recordsOf(0), 301);
+    buffer.releasePartition(0);
+    EXPECT_EQ(buffer.recordsOf(0), 0);
+}

@@ -103,7 +103,10 @@ void PartitionedRecordBuffer::startChunk(size_t partition, size_t bytes)
 
     auto * chunk = new (data) ChunkHeader{.next = nullptr, .block = block, .used = 0, .capacity = static_cast<UInt32>(capacity)};
     if (chain.last)
+    {
         chain.last->next = chunk;
+        chain.closed_chunk_records += cursor.records;
+    }
     else
         chain.first = chunk;
     chain.last = chunk;
@@ -111,6 +114,7 @@ void PartitionedRecordBuffer::startChunk(size_t partition, size_t bytes)
 
     cursor.pos = chunk->records();
     cursor.remaining = static_cast<UInt32>(capacity - sizeof(ChunkHeader) - tail_padding_bytes);
+    cursor.records = 0;
 }
 
 void PartitionedRecordBuffer::finishAppending()
