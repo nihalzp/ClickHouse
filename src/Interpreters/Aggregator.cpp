@@ -2982,7 +2982,7 @@ Aggregator::AggregatedChunk Aggregator::convertOneBucketToChunkTopK(
             [&](const auto & key, auto & mapped)
             {
                 account_key_bytes(key);
-                offer(getCountState(reinterpret_cast<AggregateDataPtr>(&mapped)), key, mapped);
+                offer(getInlineCountState(mapped), key, mapped);
             });
     }
     else
@@ -3004,7 +3004,7 @@ Aggregator::AggregatedChunk Aggregator::convertOneBucketToChunkTopK(
         std::array<PendingCell, state_prefetch_distance> pending{};
         size_t scanned = 0;
         const auto offer_pending = [&](const PendingCell & cell)
-        { offer(*reinterpret_cast<const UInt64 *>(cell.mapped + count_offset), cell.key, cell.mapped); };
+        { offer(getCountState(cell.mapped + count_offset), cell.key, cell.mapped); };
         data.forEachValue(
             [&](const auto & key, auto & mapped)
             {
@@ -3211,8 +3211,12 @@ Aggregator::AggregatedChunk Aggregator::convertOneBucketToChunkTopKByFinalizedRa
     {
         method.insertKeyIntoColumns(candidate.key, out_cols.raw_key_columns, key_sizes_ref, &serialization_settings);
         places.push_back(*candidate.mapped);
-        *candidate.mapped = nullptr;
     }
+
+    /// All keys are materialized before the states are handed to `insertResultsIntoColumns`, so the table still owns
+    /// every winner if a key insertion throws.
+    for (const auto & candidate : top)
+        *candidate.mapped = nullptr;
 
     bool use_compiled_functions = false;
 #if USE_EMBEDDED_COMPILER

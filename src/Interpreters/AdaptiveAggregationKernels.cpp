@@ -766,7 +766,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
             {
                 adaptive.miss_hashes.push_back(hash);
                 adaptive.miss_multiplicities.push_back(1);
-                /// Fixed-size keys stage no size: it is a compile-time constant the publish
+                /// Fixed-size keys stage no size: it is a compile-time constant the append
                 /// substitutes, so the hot staging loop skips a dead store per record.
                 recordStagedKey<RecordKey>(adaptive, staged_key);
 
@@ -1647,9 +1647,12 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
         && !is_simple_count && !updater;
     const size_t rank_offset = count_first ? offsets_of_aggregate_states[params.bucket_top_k_rank_index] : 0;
     const auto better = [ascending = params.bucket_top_k_ascending](UInt64 a, UInt64 b) { return ascending ? a < b : a > b; };
-    /// The table of a count-first unit's best groups, which takes the bucket's slot for the conversion while the slot's
-    /// table, grown by the counting, waits for the next unit.
-    Table best_groups_table;
+    /// A count-first unit keeps integer counts outside `AggregatedDataVariants`, whose cleanup treats mapped values
+    /// as aggregate-state pointers. Its counting table takes the buffer retained from the previous bucket, while the
+    /// bucket's own table holds the states of the best groups and remains valid during exception unwinding.
+    Table counting_table;
+    if (count_first)
+        std::swap(table, counting_table);
 
     /// A source cell whose group cannot reach the top goes with its states.
     const auto discard_cell = [&](SourceCell & cell)
@@ -1724,7 +1727,7 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
                         continue;
                     typename Table::LookupResult it;
                     bool inserted = false;
-                    emplaceSourceKey(table, cell.key, it, inserted, cell.hash);
+                    emplaceSourceKey(counting_table, cell.key, it, inserted, cell.hash);
                     const UInt64 count = getCountState(*cell.mapped + rank_offset);
                     if (inserted)
                         getInlineCountState(it->getMapped()) = count;
@@ -1735,9 +1738,9 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
                 {
                     collectPartitionRecords(session, spilled, partition, partition - first_partition, scratch.ranges);
                     pruned_records += drainAdaptivePartition<Method>(
-                        table, arena, scratch.ranges, alive_bins, places, scratch.records, /*count_only=*/true);
+                        counting_table, arena, scratch.ranges, alive_bins, places, scratch.records, /*count_only=*/true);
                 }
-                unit_groups = table.size();
+                unit_groups = counting_table.size();
 
                 /// The unit's best groups by their counts, which are exact: the unit holds every record and source cell
                 /// of its keys. With the pruning, a group counted below the threshold cannot reach the top. Only the
@@ -1747,7 +1750,7 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
                 best.clear();
                 const auto worse_first = [&](const auto & lhs, const auto & rhs) { return better(lhs.first, rhs.first); };
                 forEachMappedCellWithHashOnDemand(
-                    table,
+                    counting_table,
                     [&](AggregateDataPtr & mapped, const auto & hash_of)
                     {
                         const UInt64 count = getInlineCountState(mapped);
@@ -1783,11 +1786,10 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
                         && std::binary_search(best_hashes.begin(), best_hashes.end(), hash);
                 };
 
-                /// The second pass builds the states of the best groups, in the table that takes the bucket's slot for the
-                /// conversion: their source cells are adopted or merged and their records drained as in the ordinary
+                /// The second pass builds the states of the best groups in the bucket's table for the conversion:
+                /// their source cells are adopted or merged and their records drained as in the ordinary
                 /// merge, and the other source cells go with their states.
-                table.clear();
-                std::swap(table, best_groups_table);
+                counting_table.clear();
                 places.clear();
                 source_places.clear();
                 for (auto & cell : cells)
@@ -1902,8 +1904,6 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
         /// kept groups, and a bounded sample of those keys for when it carries none at all.
         UntruncatedAggregationKeys untruncated_keys;
         auto chunk = convertOneBucketToChunk(dest, arena, final, bucket, updater ? &untruncated_keys : nullptr, /*keep_table_buffer=*/true);
-        if (count_first)
-            std::swap(table, best_groups_table);
         if (updater)
         {
             if (untruncated_keys.bytes)
@@ -1930,6 +1930,13 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     /// sources' bucket tables only release their buffers.
     for (size_t i = 1; i < data.size(); ++i)
         getDataVariant<Method>(*data[i]).data.impls[bucket].clearAndShrink();
+
+    /// Both tables are empty after conversion, so the bucket retains the counting buffer for the next bucket.
+    if (count_first)
+    {
+        chassert(table.empty() && counting_table.empty());
+        std::swap(table, counting_table);
+    }
 
     return chunks;
 }
