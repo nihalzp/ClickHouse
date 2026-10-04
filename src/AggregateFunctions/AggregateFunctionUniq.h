@@ -777,7 +777,27 @@ public:
     }
 
     bool isAbleToParallelizeMerge() const override { return is_able_to_parallelize_merge; }
+    bool isParallelizeMergePrepareNeeded() const override { return Data::is_parallelize_merge_prepare_needed; }
+    size_t getEstimatedMergeWork(ConstAggregateDataPtr place) const override
+    {
+        if constexpr (detail::IsUniqExactSet<typename Data::Set>::value)
+            return this->data(place).set.size();
+        return 0;
+    }
     bool canOptimizeEqualKeysRanges() const override { return !is_able_to_parallelize_merge; }
+
+    void parallelizeMergePrepare(AggregateDataPtrs & places, ThreadPool & thread_pool, std::atomic<bool> & is_cancelled) const override
+    {
+        if constexpr (Data::is_parallelize_merge_prepare_needed)
+        {
+            using DataSet = typename Data::Set;
+            DataSet::parallelizeMergePrepare(places, [this](AggregateDataPtr p) { return &this->data(p).set; }, thread_pool, is_cancelled);
+        }
+        else
+        {
+            IAggregateFunction::parallelizeMergePrepare(places, thread_pool, is_cancelled);
+        }
+    }
 
     void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, ThreadPool & thread_pool, std::atomic<bool> & is_cancelled, Arena *) const override
     {
