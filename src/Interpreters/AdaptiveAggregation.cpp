@@ -157,9 +157,9 @@ void Aggregator::spillFrozenAdaptiveTable(
     AggregatedDataVariants & result, AdaptiveAggregationProducer & adaptive, size_t max_temp_file_size) const
 {
     /// A frozen table admits no new keys, so it grows only through states that keep growing after the freeze, in the
-    /// arena or in heap memory of their own; others would free little for the write. A table with the probe bypassed
-    /// absorbs no rows at all.
-    if (std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase).sampled_hits < adaptive_frozen_spill_min_hits)
+    /// arena or in heap memory of their own; others would free little for the write. Constant-key blocks can keep
+    /// updating retained states even after per-row probes are bypassed.
+    if (std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase).absorbed_rows < adaptive_frozen_spill_min_hits)
         return;
     chassert(result.hasData());
     const bool states_grow = !all_aggregates_has_trivial_destructor

@@ -2439,8 +2439,8 @@ bool Aggregator::executeOnBlock(Columns columns,
     }
     else if (adaptive && adaptive->isFrozen())
     {
-        /// The frozen adaptive path: hits update the local table in place, misses become delayed
-        /// records of the shared table.
+        /// The frozen adaptive path updates hits in the local table and stages misses as delayed records
+        /// in the producer's partition buffers for the merge.
         executeFrozen(
             columns, row_begin, row_end, result, key_columns, aggregate_functions_instructions.data(), *adaptive, all_keys_are_const);
     }

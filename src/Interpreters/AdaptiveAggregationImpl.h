@@ -283,10 +283,10 @@ struct AdaptiveAggregationProducer
     /// and misses are staged for the merge. Carries the post-freeze hit-rate
     /// sampling: when the frozen table turns out to hold almost none of the stream's keys
     /// (a uniform high-cardinality distribution), probing it is pure overhead on every row;
-    /// after the sample window the kernel switches to staging every row without the lookup.
-    /// Until then `sampled_hits` is also the count of rows the table absorbed, which is what
-    /// grows its states (see `adaptive_frozen_spill_min_hits`); with the probe bypassed, the
-    /// table absorbs nothing.
+    /// after the sample window the kernel switches to staging ordinary blocks without the lookup.
+    /// Constant-key blocks still look up their one key, so they can keep growing the retained states
+    /// even after per-row probes are bypassed. All hits count toward the frozen-table spill guard
+    /// (see `adaptive_frozen_spill_min_hits`).
     struct FrozenState
     {
         explicit FrozenState(size_t estimated_table_bytes_per_key_)
@@ -299,9 +299,27 @@ struct AdaptiveAggregationProducer
         /// size as a lower bound. This excludes staged records, other workers' memory and allocations owned
         /// directly by aggregate states, matching `AggregatedDataVariants::allocatedBytes`.
         size_t estimated_table_bytes_per_key;
+        size_t absorbed_rows = 0;
         size_t sampled_rows = 0;
-        size_t sampled_hits = 0;
         bool bypass_local_probe = false;
+
+        /// Records the rows represented by local lookups and returns whether per-row probing was just bypassed.
+        /// Constant-key blocks retain a single lookup after the sample ends, so their hits continue to count
+        /// toward state growth while the hit-rate sample stays closed.
+        bool recordLocalProbeResults(size_t hits, size_t probe_rows)
+        {
+            absorbed_rows += hits;
+            if (bypass_local_probe)
+                return false;
+            sampled_rows += probe_rows;
+            if (sampled_rows >= adaptive_bypass_sample_rows
+                && absorbed_rows * adaptive_bypass_hit_rate_inverse < sampled_rows)
+            {
+                bypass_local_probe = true;
+                return true;
+            }
+            return false;
+        }
 
         /// The thaw evidence of this thread (see `Aggregator::adaptiveStagingRepeats`): the rows the frozen table saw,
         /// the records it staged and their estimated footprint (key bytes, variable-width argument bytes and the

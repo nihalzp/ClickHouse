@@ -590,12 +590,15 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 
         /// The whole range carries one key and a set stores a key once, so a single record stands
         /// for it however many rows it spans.
-        if (!local_method.data.find(key, hash))
+        const auto found = local_method.data.find(key, hash);
+        if (!found)
         {
             stage_miss(key, hash, row_begin);
             appendDelayedRecords<RecordKey>(
                 columns, adaptive, local_find_state, scratch_pool, /*counts_only=*/false, /*key_row_override=*/0);
         }
+        if (frozen.recordLocalProbeResults(found ? row_end - row_begin : 0, row_end - row_begin))
+            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationProbeBypasses);
         keyHolderDiscardKey(key_holder);
         return;
     }
@@ -615,17 +618,8 @@ void NO_INLINE Aggregator::executeFrozenImpl(
         keyHolderDiscardKey(key_holder);
     }
 
-    if (!frozen.bypass_local_probe)
-    {
-        frozen.sampled_hits += hits;
-        frozen.sampled_rows += row_end - row_begin;
-        if (frozen.sampled_rows >= adaptive_bypass_sample_rows
-            && frozen.sampled_hits * adaptive_bypass_hit_rate_inverse < frozen.sampled_rows)
-        {
-            frozen.bypass_local_probe = true;
-            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationProbeBypasses);
-        }
-    }
+    if (frozen.recordLocalProbeResults(hits, row_end - row_begin))
+        ProfileEvents::increment(ProfileEvents::AdaptiveAggregationProbeBypasses);
 
     appendDelayedRecords<RecordKey>(
         columns, adaptive, local_find_state, scratch_pool, /*counts_only=*/false);
@@ -658,18 +652,10 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     /// The kernel runs only while the producer is frozen, and phase transitions happen between
     /// blocks, so the reference stays valid for the whole block.
     auto & frozen = std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase);
-    auto update_bypass_sampling = [&](size_t hits, size_t rows)
+    const auto record_local_probes = [&](size_t hits, size_t rows)
     {
-        if (frozen.bypass_local_probe)
-            return;
-        frozen.sampled_hits += hits;
-        frozen.sampled_rows += rows;
-        if (frozen.sampled_rows >= adaptive_bypass_sample_rows
-            && frozen.sampled_hits * adaptive_bypass_hit_rate_inverse < frozen.sampled_rows)
-        {
-            frozen.bypass_local_probe = true;
+        if (frozen.recordLocalProbeResults(hits, rows))
             ProfileEvents::increment(ProfileEvents::AdaptiveAggregationProbeBypasses);
-        }
     };
     const bool bypass_local_probe = frozen.bypass_local_probe;
 
@@ -724,6 +710,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
             appendDelayedRecords<RecordKey>(
                 columns, adaptive, local_find_state, scratch_pool, /*counts_only=*/is_simple_count, /*key_row_override=*/0);
         }
+        record_local_probes(found ? row_end - row_begin : 0, row_end - row_begin);
         keyHolderDiscardKey(key_holder);
         return;
     }
@@ -787,7 +774,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
             }
             keyHolderDiscardKey(key_holder);
         }
-        update_bypass_sampling(hits, row_end - row_begin);
+        record_local_probes(hits, row_end - row_begin);
         appendDelayedRecords<RecordKey>(columns, adaptive, local_find_state, scratch_pool, /*counts_only=*/true);
         return;
     }
@@ -831,7 +818,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     if (params.aggregates_size == 0 || bypass_local_probe)
     {
         const size_t hits = probe_rows.template operator()<false>(nullptr);
-        update_bypass_sampling(hits, row_end - row_begin);
+        record_local_probes(hits, row_end - row_begin);
         appendDelayedRecords<RecordKey>(columns, adaptive, local_find_state, scratch_pool, /*counts_only=*/false);
         return;
     }
@@ -846,7 +833,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     std::unique_ptr<AggregateDataPtr[], decltype(places_deleter)> places(allocator.allocate(places_size), places_deleter);
 
     const size_t hits = probe_rows.template operator()<true>(places.get());
-    update_bypass_sampling(hits, row_end - row_begin);
+    record_local_probes(hits, row_end - row_begin);
     appendDelayedRecords<RecordKey>(columns, adaptive, local_find_state, scratch_pool, /*counts_only=*/false);
 
     /// With no local hits every place is null and the batch pass would only skip rows; the
