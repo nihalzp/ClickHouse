@@ -159,9 +159,9 @@ void Aggregator::spillFrozenAdaptiveTable(
     /// A frozen table admits no new keys, so it grows only through states that keep growing after the freeze, in the
     /// arena or in heap memory of their own; others would free little for the write. A table with the probe bypassed
     /// absorbs no rows at all.
-    if (std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase).sampled_hits < adaptive_frozen_spill_min_hits
-        || !result.hasData())
+    if (std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase).sampled_hits < adaptive_frozen_spill_min_hits)
         return;
+    chassert(result.hasData());
     const bool states_grow = !all_aggregates_has_trivial_destructor
         || std::ranges::any_of(aggregate_functions, [](const IAggregateFunction * function) { return function->allocatesMemoryInArena(); });
     if (!states_grow)

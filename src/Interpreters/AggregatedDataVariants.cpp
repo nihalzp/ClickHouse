@@ -254,6 +254,7 @@ bool AggregatedDataVariants::isConvertibleToTwoLevel(Type type_)
 
 void AggregatedDataVariants::resetToSingleLevel()
 {
+    chassert(!hasData());
     switch (type)
     {
 #define M(NAME) \

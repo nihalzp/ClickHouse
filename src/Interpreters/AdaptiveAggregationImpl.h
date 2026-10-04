@@ -247,8 +247,6 @@ struct AdaptiveAggregationSession
     std::atomic<size_t> repeat_dominated_producers{0};
 };
 
-using AdaptiveAggregationSessionPtr = std::shared_ptr<AdaptiveAggregationSession>;
-
 /// The working memory of one adaptive merge task, kept across the buckets it merges so their units do not allocate
 /// it again: the places and the source places of a unit's merge, the record pointers and ranges of a partition, and
 /// for a count-first unit the best groups by their counts and the records of those groups.
