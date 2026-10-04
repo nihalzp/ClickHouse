@@ -23,9 +23,9 @@ public:
     /// unit's table to stay in a task's share; every partition, though, costs the producers' appends and the merge's
     /// walk a fixed overhead per chunk, so a small bucket wants few. About the square root of the producers, half the
     /// bits of their count rounded up, balanced the two over the high-cardinality aggregations of ClickBench at 16 and
-    /// 64 threads, with 4 and 8 partitions per bucket. With an external-aggregation threshold the first chunks of all
-    /// streams also stay within a quarter of it, so the staging floor cannot hold the query over the threshold by
-    /// itself. At most 16 partitions per bucket, the four free hash bits.
+    /// 64 threads, with 4 and 8 partitions per bucket. An external-aggregation threshold reduces the subdivision so
+    /// the first chunks of all streams fit within a quarter of it where the minimum of one partition per bucket
+    /// allows. The four free hash bits allow at most 16 partitions per bucket.
     static AdaptivePartitionLayout forProducers(size_t producers, size_t max_bytes_before_external_group_by);
 
     size_t partitionsPerBucket() const { return numPartitions() / ADAPTIVE_AGGREGATION_NUM_BUCKETS; }

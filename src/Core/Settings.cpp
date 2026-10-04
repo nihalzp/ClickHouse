@@ -4846,7 +4846,9 @@ The memory size at which the adaptive aggregator freezes a thread's local hash t
 )", 0, \
         {"26.9", 4194304, 4194304, "New setting bounding the adaptive aggregator's frozen local tables in bytes, whichever of it and the key-count threshold is reached first; 0 disables the byte bound."}) \
     DECLARE(Bool, adaptive_aggregator_disable_thaw, false, R"(
-Disables the thaw of the adaptive aggregator (see `enable_adaptive_aggregator`). By default, when the rows that miss the frozen tables keep repeating the same keys instead of bringing new ones, every thread thaws its table and finishes the aggregation in the ordinary way, and the verdict is remembered in the hash-table statistics (`collect_hash_table_stats_during_aggregation`), so that later runs of the query do not use the adaptive aggregator at all. With this setting, the tables stay frozen until the input ends, whatever the repeats, and a remembered verdict is ignored.
+Disables the per-thread thaw guard of the adaptive aggregator (see `enable_adaptive_aggregator`). By default, a thread whose staged records keep repeating the same keys can thaw its table and resume ordinary aggregation. When at least half of the frozen threads have repeat-dominated staged streams, the verdict is remembered in the hash-table statistics (`collect_hash_table_stats_during_aggregation`), so that later runs of the query do not use the adaptive aggregator.
+
+With this setting, repeated staged keys do not thaw a table, and a remembered verdict is ignored. Aggregations with descending top-K pruning already keep their tables frozen independently of this setting. The external aggregation settings still allow a growing frozen table to be written to disk and replaced with a new learning table.
 )", 0, \
         {"26.10", false, false, "New setting to keep the adaptive aggregator's local tables frozen whatever the repeats of the staged keys, ignoring a thaw verdict remembered in the hash-table statistics."}) \
     DECLARE(Bool, read_in_order_use_buffering, true, R"(
