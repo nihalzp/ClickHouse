@@ -190,10 +190,10 @@ namespace
     template <typename Table, typename Key>
     void ALWAYS_INLINE emplaceSourceKey(Table & table, const Key & key, typename Table::LookupResult & it, bool & inserted, size_t hash)
     {
-        if constexpr (requires { table.begin(); })
-            table.emplace(key, it, inserted, hash);
-        else
+        if constexpr (requires { table.emplaceIteratedKey(key, it, inserted, hash); })
             table.emplaceIteratedKey(key, it, inserted, hash);
+        else
+            table.emplace(key, it, inserted, hash);
     }
 
     /// Prefetches the table slot of a staged record ahead of its emplace: hash-organized tables
