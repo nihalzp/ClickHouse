@@ -1700,6 +1700,14 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
 
         /// The groups of the unit, which a count-first unit does not keep in its table.
         size_t unit_groups = 0;
+        const auto merge_source_states = [&]
+        {
+            if (source_places.empty())
+                return;
+            mergeAdaptiveSourceStates(scratch, session, arena, is_cancelled);
+            for (auto & cell : cells)
+                *cell.mapped = nullptr;
+        };
         if (count_first)
         {
             if constexpr (MapAggregationMethod<Method>)
@@ -1793,15 +1801,15 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
                     if (inserted)
                     {
                         it->getMapped() = source_place;
+                        source_place = nullptr;
                     }
                     else
                     {
                         places.push_back(it->getMapped());
                         source_places.push_back(source_place);
                     }
-                    source_place = nullptr;
                 }
-                mergeAdaptiveSourceStates(scratch, session, arena, is_cancelled);
+                merge_source_states();
                 for (size_t partition = unit_first_partition; partition < unit_first_partition + partitions_per_unit; ++partition)
                 {
                     collectPartitionRecords(session, spilled, partition, partition - first_partition, scratch.ranges);
@@ -1847,19 +1855,20 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
                             getInlineCountState(it->getMapped()) = getInlineCountState(source_place);
                         else
                             getInlineCountState(it->getMapped()) += getInlineCountState(source_place);
+                        source_place = nullptr;
                     }
                     else if (inserted)
                     {
                         it->getMapped() = source_place;
+                        source_place = nullptr;
                     }
                     else
                     {
                         places.push_back(it->getMapped());
                         source_places.push_back(source_place);
                     }
-                    source_place = nullptr;
                 }
-                mergeAdaptiveSourceStates(scratch, session, arena, is_cancelled);
+                merge_source_states();
             }
             else
             {

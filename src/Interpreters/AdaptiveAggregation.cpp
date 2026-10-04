@@ -280,6 +280,7 @@ void Aggregator::mergeAdaptiveSourceStates(
         adaptive_parallel_merge_max_work);
 
     auto & order = scratch.merge_order;
+    auto & group = scratch.merge_group;
     bool ordered = false;
     for (size_t i = 0; i < params.aggregates_size; ++i)
     {
@@ -287,7 +288,10 @@ void Aggregator::mergeAdaptiveSourceStates(
         const size_t offset = offsets_of_aggregate_states[i];
         if (!function.isAbleToParallelizeMerge() || !function.isParallelizeMergePrepareNeeded())
         {
-            function.mergeAndDestroyBatch(places.data(), source_places.data(), merges, offset, *thread_pool, is_cancelled, arena);
+            group.resize(merges);
+            for (size_t j = 0; j < merges; ++j)
+                group[j] = source_places[j] + offset;
+            function.mergeBatch(0, merges, places.data(), offset, group.data(), *thread_pool, is_cancelled, arena);
             continue;
         }
 
@@ -302,7 +306,6 @@ void Aggregator::mergeAdaptiveSourceStates(
             std::ranges::stable_sort(order, [&](UInt32 lhs, UInt32 rhs) { return std::less<AggregateDataPtr>{}(places[lhs], places[rhs]); });
             ordered = true;
         }
-        auto & group = scratch.merge_group;
         for (size_t begin = 0; begin < merges;)
         {
             size_t end = begin + 1;
@@ -315,10 +318,7 @@ void Aggregator::mergeAdaptiveSourceStates(
             if (group_work <= min_parallel_work)
             {
                 for (size_t k = begin; k < end; ++k)
-                {
                     function.merge(places[order[k]] + offset, source_places[order[k]] + offset, arena);
-                    function.destroy(source_places[order[k]] + offset);
-                }
             }
             else
             {
@@ -328,12 +328,17 @@ void Aggregator::mergeAdaptiveSourceStates(
                     group.push_back(source_places[order[k]] + offset);
                 function.parallelizeMergePrepare(group, *thread_pool, is_cancelled);
                 function.parallelizeMergeMulti(group, *thread_pool, is_cancelled, arena);
-                for (size_t k = begin; k < end; ++k)
-                    function.destroy(source_places[order[k]] + offset);
             }
             begin = end;
         }
     }
+
+    /// Source tables retain ownership until every aggregate has merged successfully, so an exception
+    /// leaves complete states for their ordinary cleanup. Destruction is non-throwing; the caller clears
+    /// the source slots immediately after this call returns.
+    for (size_t i = 0; i < params.aggregates_size; ++i)
+        if (!aggregate_functions[i]->hasTrivialDestructor())
+            aggregate_functions[i]->destroyBatch(0, merges, source_places.data(), offsets_of_aggregate_states[i]);
 }
 
 bool Aggregator::adaptiveMayThaw(const AdaptiveAggregationSession & shared) const

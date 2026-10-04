@@ -792,8 +792,9 @@ private:
     void freezeAdaptive(AggregatedDataVariants & result, AdaptiveAggregationProducer & adaptive) const;
 
     /// Merges the source states of a merge unit into their destinations (`scratch.places` and `scratch.source_places`)
-    /// and destroys the sources. A group's states use the pool when their combined work can amortize its setup
-    /// or hold up the remaining merge; smaller groups retain the parallelism across buckets.
+    /// and destroys the sources after all aggregates merge successfully. Source table slots keep ownership until
+    /// this call returns, when the caller clears them. A group's states use the pool when their combined work
+    /// amortizes its setup or would hold up the remaining merge; smaller groups use the parallelism across buckets.
     void mergeAdaptiveSourceStates(
         AdaptiveMergeScratch & scratch, const AdaptiveAggregationSession & session, Arena * arena, std::atomic<bool> & is_cancelled) const;
 
