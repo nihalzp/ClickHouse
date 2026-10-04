@@ -760,7 +760,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
                 /// A serialized key view points into the reused scratch arena and can only seed
                 /// the run tracking when the views are block-stable; every other key type is
                 /// either a self-contained value or, for a packed reference, points into the
-                /// block's key column, whose bytes outlive the block.
+                /// block's key column, whose bytes remain alive throughout the row loop.
                 if constexpr (std::is_same_v<RecordKey, std::string_view>)
                 {
                     if (stable_key_views)
