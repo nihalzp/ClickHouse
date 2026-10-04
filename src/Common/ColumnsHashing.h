@@ -238,6 +238,13 @@ struct HashMethodSingleLowCardinalityColumn : public SingleColumnMethod
         return Base::getKeyHolder(getIndexAt(row), pool);
     }
 
+    /// Resolves the source row through the dictionary before exposing the base method's padded key bytes.
+    std::string_view getKeyBytes(size_t row) const
+        requires requires (const Base & base) { base.getKeyBytes(row); }
+    {
+        return Base::getKeyBytes(getIndexAt(row));
+    }
+
     template <typename Data>
     ALWAYS_INLINE EmplaceResult emplaceKey(Data & data, size_t row_, Arena & pool)
     {
@@ -561,6 +568,10 @@ struct HashMethodSerialized
     }
 
     friend class columns_hashing_impl::HashMethodBase<Self, Value, Mapped, false>;
+
+    /// Batch serialization retains every key for the block. The other paths reuse scratch or roll back
+    /// the key's arena allocation on discard, so their views cannot be retained between rows.
+    bool keyViewsAreBlockStable() const { return use_batch_serialize; }
 
     ALWAYS_INLINE ArenaKeyHolder getKeyHolder(size_t row, Arena & pool) const
     requires prealloc

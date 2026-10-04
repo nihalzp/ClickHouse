@@ -91,13 +91,9 @@ namespace
     template <typename State, typename Callback>
     void ALWAYS_INLINE withStagedKeyBytes(State & state, size_t row, size_t size, DB::Arena & scratch, Callback && callback)
     {
-        /// The fast path requires buffers indexed by the block row directly; the low-cardinality
-        /// wrapper inherits `chars`/`offsets` bound to its dictionary (rows go through
-        /// `positions`), so it is excluded structurally rather than left to the admission gate.
-        if constexpr (requires { state.chars; state.offsets; } && !requires { state.positions; })
+        if constexpr (requires { state.getKeyBytes(row); })
         {
-            const char * data
-                = reinterpret_cast<const char *>(state.chars) + state.offsets[static_cast<ssize_t>(row) - 1];
+            const char * data = state.getKeyBytes(row).data();
             callback(KeyBytesRef{std::string_view(data, size), ReadablePadding::AtLeast15Bytes});
         }
         else
@@ -205,20 +201,6 @@ namespace
             table.prefetchByHash(routing_hash);
         else if constexpr (std::is_same_v<Key, std::string_view>)
             table.prefetch(std::string_view(key_pos, key_size), routing_hash);
-    }
-
-    /// Whether the string views the state's key holders hand out point into storage that
-    /// outlives the row loop (a batch-serialized buffer or the key column itself) rather than
-    /// into per-row scratch that dies with the holder. Only the serialized methods can go
-    /// either way, and they expose the choice as `use_batch_serialize`; the run tracking in
-    /// the count kernel may only remember a previous key's view when this holds.
-    template <typename State>
-    bool ALWAYS_INLINE adaptiveKeyViewsAreBlockStable(const State & state)
-    {
-        if constexpr (requires { state.use_batch_serialize; })
-            return state.use_batch_serialize;
-        else
-            return true;
     }
 
     /// The staged record formats. A record never straddles two chunks, and nothing in it points
@@ -719,7 +701,7 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     {
         size_t hits = 0;
         RecordKey last_staged_key{};
-        [[maybe_unused]] const bool stable_key_views = adaptiveKeyViewsAreBlockStable(local_find_state);
+        [[maybe_unused]] const bool stable_key_views = local_find_state.keyViewsAreBlockStable();
         for (size_t i = row_begin; i < row_end; ++i)
         {
             auto && key_holder = local_find_state.getKeyHolder(i, scratch_pool);
