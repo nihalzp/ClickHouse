@@ -5,12 +5,13 @@
 #include <new>
 
 #include <Common/Allocator.h>
+#include <Common/CacheLine.h>
 #include <Common/memory.h>
 
 namespace DB
 {
 
-struct alignas(64) PartitionedRecordBuffer::Block
+struct alignas(CH_CACHE_LINE_SIZE) PartitionedRecordBuffer::Block
 {
     /// One reference for the carver while it carves from the block, and one per chunk carved and not yet released.
     std::atomic<UInt32> references{1};

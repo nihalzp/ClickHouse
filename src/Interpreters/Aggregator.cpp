@@ -35,6 +35,7 @@
 #include <Interpreters/JIT/compileFunction.h>
 #include <Interpreters/TemporaryDataOnDisk.h>
 #include <Common/ThreadPool.h>
+#include <Common/CacheLine.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/CurrentThread.h>
 #include <Common/FieldAccurateComparison.h>
@@ -3184,7 +3185,7 @@ Aggregator::AggregatedChunk Aggregator::convertOneBucketToChunkTopKByFinalizedRa
         [&](const auto & key, auto & mapped)
         {
             account_key_bytes(key);
-            for (size_t line = 0; line < rank_state_bytes; line += 64)
+            for (size_t line = 0; line < rank_state_bytes; line += CH_CACHE_LINE_SIZE)
                 __builtin_prefetch(mapped + rank_offset + line);
             PendingCell & slot = pending[scanned % state_prefetch_distance];
             if (scanned >= state_prefetch_distance)
