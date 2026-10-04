@@ -85,6 +85,27 @@ TEST(AggregateMergeWork, VariadicAndTupleArguments)
     checkWork(*tuple, *tuple, {ColumnTuple::create(Columns{values(), values()})}, 3);
 }
 
+TEST(AggregateMergeWork, TupleCombinatorStateOffsets)
+{
+    const auto type = std::make_shared<DataTypeUInt64>();
+    const auto nullable_type = std::make_shared<DataTypeNullable>(type);
+    const auto tuple_type = std::make_shared<DataTypeTuple>(DataTypes{type, nullable_type});
+    auto nullable = nullable_type->createColumn();
+    nullable->insert(UInt64{1});
+    nullable->insertDefault();
+    nullable->insert(UInt64{1});
+    nullable->insert(UInt64{2});
+    const Columns columns{ColumnTuple::create(Columns{values(), std::move(nullable)})};
+
+    /// Tuple elements retain separate states, so their merge work adds even when their values overlap.
+    const auto exact = getFunction("uniqExactTuple", {tuple_type});
+    checkWork(*exact, *exact, columns, 5);
+    checkWork(*exact, *exact, {tuple_type->createColumn()}, 0);
+
+    const auto approximate = getFunction("uniqTuple", {tuple_type});
+    checkWork(*approximate, *approximate, columns, 0, false);
+}
+
 TEST(AggregateMergeWork, NullableStateOffsets)
 {
     const auto type = std::make_shared<DataTypeUInt64>();
