@@ -127,6 +127,9 @@ static constexpr auto DBMS_MERGE_TREE_PART_INFO_VERSION = 1;
 /// needs the new contract is not serialized for such a peer at all.
 /// Version 20 also registers the `BlocksMarshalling` step, so a plan fragment that pre-serializes its
 /// result blocks can be shipped. A peer below it does not know the name and rejects the whole plan.
+/// Version 20 also adds `max_external_merge_fan_in` to the sorting, `DISTINCT` and join step settings.
+/// A peer below it would reject the name, so plans sent to such a peer omit the setting, and the peer
+/// merges its temporary files without a fan-in limit.
 ///
 /// Rules for this version:
 /// - Bump it at most once per release: the first change in a release that needs it bumps it, later changes
