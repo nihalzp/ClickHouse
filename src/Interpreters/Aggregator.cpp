@@ -1442,9 +1442,9 @@ void Aggregator::freezeAdaptive(AggregatedDataVariants & result, AdaptiveAggrega
     if (adaptive.session->top_k_pruning && !adaptive.count_bins)
         adaptive.count_bins = std::make_unique<UInt16[]>(adaptive_count_bins);
     const size_t keys = result.sizeWithoutOverflowRow();
-    /// A zero threshold freezes before any key is inserted, so no per-key allocation cost has been measured.
-    /// The aggregate state size supplies a lower bound without measured hash-table and arena overhead.
-    chassert(keys || params.adaptive_aggregator_freeze_threshold == 0);
+    /// A zero key-count threshold or byte pressure can freeze a table before its first group is inserted.
+    /// Without a measured per-key allocation cost, the aggregate state size supplies a lower bound
+    /// that excludes hash-table and arena overhead.
     adaptive.freeze(keys ? result.allocatedBytes() / keys : total_size_of_aggregate_states);
     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationLocalFreezes);
     LOG_TRACE(log, "Adaptive aggregation: local table frozen at {} keys", keys);
