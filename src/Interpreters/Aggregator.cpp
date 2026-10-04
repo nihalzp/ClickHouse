@@ -2831,6 +2831,13 @@ private:
 
 }
 
+std::optional<UInt64> Aggregator::getPeakMemoryUsage() const
+{
+    if (!memory_tracker)
+        return std::nullopt;
+    return std::max<Int64>(memory_tracker->getPeak(), 0);
+}
+
 /// Ends a conversion's use of its table: frees the buffer in order to release memory early, or keeps it, emptied,
 /// for a caller that fills the table again.
 template <typename Table>
