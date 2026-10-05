@@ -31,6 +31,10 @@ constexpr size_t adaptive_bypass_sample_rows = 65'536;
 constexpr size_t adaptive_bypass_hit_rate_inverse = 4;
 /// Lookahead of the append-position prefetch into the producer's partitions (see `appendDelayedRecords`).
 constexpr size_t adaptive_append_prefetch_distance = 8;
+/// Partition-count combining starts with a bounded trial of nonconsecutive misses in each block.
+constexpr size_t adaptive_count_combining_sample_records = 1024;
+/// Combining continues only if at least one lookup in this many reuses a missed key's count descriptor.
+constexpr size_t adaptive_count_combining_min_hit_rate_inverse = 8;
 /// Fixed-width arguments are gathered column by column into bounded batches of staged records, so
 /// width and nullability are dispatched once per field while the destination rows remain in cache.
 constexpr size_t adaptive_argument_staging_batch_rows = 1024;

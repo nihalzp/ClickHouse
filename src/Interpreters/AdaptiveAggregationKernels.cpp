@@ -229,7 +229,7 @@ namespace
     }
 
     /// Count and key-only records: {[UInt64 hash,] [UInt32 count,] [UInt32 size,] key}. The count is
-    /// a run length within one block, which a UInt32 holds. A key whose width varies is staged with
+    /// a contribution within one block, which a UInt32 holds. A key whose width varies is staged with
     /// the hash and its UInt32 size; a fixed-width key has the compile-time width, so its records
     /// have a fixed stride, and carries no hash.
     template <typename Key, bool with_count>
@@ -699,62 +699,155 @@ void NO_INLINE Aggregator::executeFrozenImpl(
 
     if (is_simple_count)
     {
-        size_t hits = 0;
-        RecordKey last_staged_key{};
+        constexpr bool can_combine_partition_counts = adaptive_key_stages_bytes<RecordKey>
+            && requires { local_find_state.getKeyBytes(0); };
         [[maybe_unused]] const bool stable_key_views = local_find_state.keyViewsAreBlockStable();
-        for (size_t i = row_begin; i < row_end; ++i)
+        struct PartitionCountEntry
         {
-            auto && key_holder = local_find_state.getKeyHolder(i, scratch_pool);
-            const auto & key = keyHolderGetKey(key_holder);
-            const UInt64 hash = local_method.data.hash(key);
+            RecordKey key{};
+            size_t record_index = std::numeric_limits<size_t>::max();
+        };
+        std::vector<PartitionCountEntry> last_partition_keys;
+        const AdaptivePartitionLayout layout = adaptive.session->layout;
+        if constexpr (can_combine_partition_counts)
+        {
+            chassert(stable_key_views);
+            chassert(row_end - row_begin <= std::numeric_limits<UInt32>::max());
+            last_partition_keys.resize(layout.numPartitions());
+        }
 
-            if (!bypass_local_probe)
+        struct CountMissesResult
+        {
+            size_t next_row;
+            size_t hits;
+        };
+        const auto collect_count_misses = [&, row_end, bypass_local_probe, layout]
+            <bool combine_partition_counts>(size_t begin) ALWAYS_INLINE -> CountMissesResult
+        {
+            size_t hits = 0;
+            /// Only this pass's new descriptors seed consecutive runs. The trial's last missed key may
+            /// refer to an earlier descriptor rather than the last one in the array.
+            const size_t first_record = can_combine_partition_counts ? adaptive.miss_hashes.size() : 0;
+            size_t last_record = 0;
+            size_t combining_lookups = 0;
+            size_t combined_records = 0;
+            bool stop_combining = false;
+            RecordKey last_staged_key{};
+            for (size_t i = begin; i < row_end; ++i)
             {
-                if (auto it = local_method.data.find(key, hash))
+                auto && key_holder = local_find_state.getKeyHolder(i, scratch_pool);
+                const auto & key = keyHolderGetKey(key_holder);
+                const UInt64 hash = local_method.data.hash(key);
+
+                if (!bypass_local_probe)
                 {
-                    ++hits;
-                    ++getInlineCountState(it->getMapped());
-                    keyHolderDiscardKey(key_holder);
-                    continue;
+                    if (auto it = local_method.data.find(key, hash))
+                    {
+                        ++hits;
+                        ++getInlineCountState(it->getMapped());
+                        keyHolderDiscardKey(key_holder);
+                        continue;
+                    }
                 }
-            }
 
-            const RecordKey staged_key = key;
+                const RecordKey staged_key = key;
 
-            bool run_continues = !adaptive.miss_hashes.empty() && adaptive.miss_hashes.back() == hash;
-            if constexpr (std::is_same_v<RecordKey, std::string_view>)
-                run_continues = run_continues && stable_key_views && staged_key == last_staged_key;
-            else
-                run_continues = run_continues && staged_key == last_staged_key;
-
-            if (run_continues)
-            {
-                ++adaptive.miss_multiplicities.back();
-            }
-            else
-            {
-                adaptive.miss_hashes.push_back(hash);
-                adaptive.miss_multiplicities.push_back(1);
-                /// Fixed-size keys stage no size: it is a compile-time constant the append
-                /// substitutes, so the hot staging loop skips a dead store per record.
-                recordStagedKey<RecordKey>(adaptive, staged_key);
-
-                /// A serialized key view points into the reused scratch arena and can only seed
-                /// the run tracking when the views are block-stable; every other key type is
-                /// either a self-contained value or, for a packed reference, points into the
-                /// block's key column, whose bytes remain alive throughout the row loop.
+                bool run_continues = (can_combine_partition_counts
+                    ? adaptive.miss_hashes.size() != first_record : !adaptive.miss_hashes.empty())
+                    && (combine_partition_counts ? adaptive.miss_hashes[last_record] : adaptive.miss_hashes.back()) == hash;
                 if constexpr (std::is_same_v<RecordKey, std::string_view>)
+                    run_continues = run_continues && stable_key_views && staged_key == last_staged_key;
+                else
+                    run_continues = run_continues && staged_key == last_staged_key;
+
+                if (run_continues)
                 {
-                    if (stable_key_views)
-                        last_staged_key = staged_key;
+                    auto & multiplicity = combine_partition_counts
+                        ? adaptive.miss_multiplicities[last_record] : adaptive.miss_multiplicities.back();
+                    ++multiplicity;
                 }
                 else
                 {
-                    last_staged_key = staged_key;
+                    size_t record = adaptive.miss_hashes.size();
+                    if constexpr (combine_partition_counts)
+                    {
+                        /// Keep each partition's last missed key for this block. Its bytes remain alive until
+                        /// the append copies them into owned records; only the descriptor's count changes here.
+                        /// Packed-key equality checks its inline signature before comparing the string bytes.
+                        auto & last = last_partition_keys[layout.partitionOf(hash)];
+                        if (last.record_index != std::numeric_limits<size_t>::max()
+                            && (std::is_same_v<RecordKey, PackedStringRef> || adaptive.miss_hashes[last.record_index] == hash)
+                            && staged_key == last.key)
+                        {
+                            record = last.record_index;
+                            ++combined_records;
+                        }
+                        else
+                        {
+                            last = {staged_key, record};
+                        }
+                        ++combining_lookups;
+                        if (combining_lookups == adaptive_count_combining_sample_records
+                            && combined_records * adaptive_count_combining_min_hit_rate_inverse < combining_lookups)
+                        {
+                            stop_combining = true;
+                        }
+                    }
+
+                    if (record == adaptive.miss_hashes.size())
+                    {
+                        adaptive.miss_hashes.push_back(hash);
+                        adaptive.miss_multiplicities.push_back(1);
+                        /// Fixed-size keys stage no size: it is a compile-time constant the append
+                        /// substitutes, so the hot staging loop skips a dead store per record.
+                        recordStagedKey<RecordKey>(adaptive, staged_key);
+                        adaptive.miss_source_rows.push_back(static_cast<UInt32>(i));
+                    }
+                    else
+                    {
+                        ++adaptive.miss_multiplicities[record];
+                    }
+                    last_record = record;
+
+                    /// A serialized key view points into the reused scratch arena and can only seed
+                    /// the run tracking when the views are block-stable; every other key type is
+                    /// either a self-contained value or, for a packed reference, points into the
+                    /// block's key column, whose bytes remain alive throughout the row loop.
+                    if constexpr (std::is_same_v<RecordKey, std::string_view>)
+                    {
+                        if (stable_key_views)
+                            last_staged_key = staged_key;
+                    }
+                    else
+                    {
+                        last_staged_key = staged_key;
+                    }
                 }
-                adaptive.miss_source_rows.push_back(static_cast<UInt32>(i));
+                keyHolderDiscardKey(key_holder);
+                if constexpr (combine_partition_counts)
+                {
+                    if (stop_combining)
+                        return {i + 1, hits};
+                }
             }
-            keyHolderDiscardKey(key_holder);
+            return {row_end, hits};
+        };
+
+        size_t hits = 0;
+        if constexpr (can_combine_partition_counts)
+        {
+            const auto trial = collect_count_misses.template operator()<true>(row_begin);
+            hits = trial.hits;
+            if (trial.next_row != row_end)
+            {
+                /// Keep the trial's descriptors for the common append. The remainder tracks consecutive
+                /// runs among its own new descriptors and performs no partition-cache lookups.
+                hits += collect_count_misses.template operator()<false>(trial.next_row).hits;
+            }
+        }
+        else
+        {
+            hits = collect_count_misses.template operator()<false>(row_begin).hits;
         }
         record_local_probes(hits, row_end - row_begin);
         appendDelayedRecords<RecordKey>(columns, adaptive, local_find_state, scratch_pool, /*counts_only=*/true);
@@ -1030,7 +1123,8 @@ void NO_INLINE Aggregator::appendDelayedRecords(
         }
     }
 
-    /// The rows behind the records go to the count bins of the top-K pruning: a count record stands for its run.
+    /// The rows behind the records go to the count bins of the top-K pruning: a count record carries
+    /// its combined multiplicity.
     if (adaptive.count_bins)
     {
         UInt16 * bins = adaptive.count_bins.get();
@@ -1048,7 +1142,7 @@ void NO_INLINE Aggregator::appendDelayedRecords(
     ///   aggregate arguments at their serialized sizes, and the per-record bookkeeping (the
     ///   eight-byte routing hash, plus eight bytes of key size and padding only for byte-staged
     ///   keys). A column read by several aggregates is staged once, so it is counted once; a
-    ///   count batch stages a run length instead of arguments.
+    ///   count batch stages the combined multiplicity instead of arguments.
     ///   Variable-width arguments count in full because staging such a value pays real work
     ///   at every step. The record copies it out of the block, the record pins that memory
     ///   until the merge drains it, and updating the aggregate state from it copies the value
