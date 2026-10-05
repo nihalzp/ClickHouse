@@ -181,7 +181,8 @@ TEST_P(AggregatorAdaptiveMerge, SourceStateLifetimes)
             }
 
             auto & table = sources.front()->key64_two_level->data;
-            const auto bucket = static_cast<Int32>(table.getBucketFromHash(table.hash(UInt64{1})));
+            const auto bucket = static_cast<Int32>(
+                AggregatedDataWithUInt64KeyTwoLevel::getBucketFromHash(table.hash(UInt64{1})));
             auto prepared = aggregator.prepareVariantsToMerge(std::move(sources), session.get());
             prepared.front()->adaptive_merge_bucket_arenas.resize(ADAPTIVE_AGGREGATION_NUM_BUCKETS);
             for (auto & arena : prepared.front()->adaptive_merge_bucket_arenas)
