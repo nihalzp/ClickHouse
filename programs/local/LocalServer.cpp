@@ -1502,7 +1502,8 @@ void LocalServer::processConfig()
     {
         getClientConfiguration().setString("logger", "logger");
         getClientConfiguration().setString("logger.level", logging ? level : "fatal");
-        buildLoggers(getClientConfiguration(), logger(), "clickhouse-local");
+        /// Crash reports must reach stderr, which the configured channels may not write to.
+        buildLoggers(getClientConfiguration(), logger(), "clickhouse-local", {fatal_log_name});
     }
 
     shared_context = Context::createShared();
@@ -1904,6 +1905,7 @@ void LocalServer::processConfig()
         /// Lock path directory before read
         fs::create_directories(fs::path(path));
         status.emplace(fs::path(path) / "status", StatusFile::write_full_info);
+        bool started_background_tasks = false;
 
         /// With `--only-system-tables` the directory is only inspected, so the default database is not recorded in it.
         if (!server_default_database.empty() && !getClientConfiguration().has("only-system-tables"))
@@ -1927,9 +1929,17 @@ void LocalServer::processConfig()
                 DatabaseCatalog::instance().createBackgroundTasks();
                 waitLoad(loadMetadata(global_context));
                 DatabaseCatalog::instance().startupBackgroundTasks();
+                started_background_tasks = true;
             }
 
             LOG_DEBUG(log, "Loaded metadata.");
+        }
+
+        /// `DROP ... SYNC` waits for the drop task, so it has to run also when no metadata was loaded.
+        if (!started_background_tasks)
+        {
+            DatabaseCatalog::instance().createBackgroundTasks();
+            DatabaseCatalog::instance().startupBackgroundTasks();
         }
 
         if (!attached_system_database)
@@ -1992,7 +2002,8 @@ void LocalServer::processConfig()
         prompt = getClientConfiguration().getString("prompt");
     else if (getClientConfiguration().has("prompt_by_server_display_name.default"))
         prompt = getClientConfiguration().getRawString("prompt_by_server_display_name.default");
-    prompt = appendSmileyIfNeeded(prompt);
+    else
+        prompt = "{display_name}";
 
     /// Set default ports if not specified, so SYSTEM START LISTEN works out of the box.
     if (!getClientConfiguration().has("tcp_port"))
