@@ -23,7 +23,7 @@ for aggregate in \
 do
     echo "$aggregate"
     query="SELECT n % 20000 AS k, ${aggregate}
-        FROM (SELECT number AS n FROM numbers_mt(800000)) GROUP BY k ORDER BY k"
+        FROM (SELECT number AS n FROM numbers_mt(80000)) GROUP BY k ORDER BY k"
     for adaptive in 0 1
     do
         $CLICKHOUSE_LOCAL --query "
