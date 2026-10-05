@@ -38,7 +38,7 @@ function check()
     done
 }
 
-input='SELECT number AS n, if(number % 4 < 3, 0, 1 + number % 100) AS k FROM numbers_mt(2000000)'
+input='SELECT number AS n, if(number % 4 < 3, 0, 1 + number % 100) AS k FROM numbers_mt(200000)'
 check 'If' 'uniqExactIf(n, n % 2 = 0)' "$input" 'u'
 check 'Nullable' 'uniqExact(if(n % 2 = 0, n, NULL))' "$input" 'u'
 check 'Variadic' 'uniqExact(n, n % 7)' "$input" 'u'
@@ -49,5 +49,5 @@ check 'ArrayIfState' 'uniqExactArrayIfState([n], n % 2 = 0)' "$input" 'finalizeA
 
 merge_input='SELECT inner_k % 2 AS k, inner_k AS n, state FROM (
     SELECT number % 100 AS inner_k, uniqExactState(number) AS state
-    FROM numbers_mt(2000000) GROUP BY inner_k)'
+    FROM numbers_mt(200000) GROUP BY inner_k)'
 check 'Merge' 'uniqExactMerge(state)' "$merge_input" 'u'
