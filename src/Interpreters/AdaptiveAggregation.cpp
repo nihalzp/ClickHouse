@@ -28,21 +28,18 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-namespace
-{
-
 /// Compares the repeated records' staging cost with the state an ordinary table would retain. Distinct keys
 /// are estimated by scaling the hash sample; the record count is known exactly. Counting only sampled
 /// occurrences would let one frequent sampled key distort the repetition estimate for the whole stream.
 /// Growing set states also retain distinct arguments, even when their group keys repeat. Their estimated
 /// payload is added to the per-key state cost. Multiplication by the record count avoids division, and
 /// 128-bit products accommodate streams of billions of records without overflow.
-bool adaptiveStagingWastes(
-    const AdaptiveAggregationProducer::FrozenState & frozen,
+bool Aggregator::adaptiveStagingWastes(
+    const AdaptiveAggregationProducer & adaptive,
     size_t state_bytes_per_key,
-    size_t state_bytes_per_distinct_input,
-    size_t state_cost_multiplier)
+    size_t state_cost_multiplier) const
 {
+    const auto & frozen = std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase);
     const size_t distinct = frozen.getEstimatedStagedKeyCount();
     if (frozen.staged_records < adaptive_thaw_min_staged_records
         || frozen.staged_records * adaptive_thaw_staged_share_inverse < frozen.rows
@@ -51,11 +48,17 @@ bool adaptiveStagingWastes(
 
     const size_t retained_bytes_per_key = std::max(adaptive_staging_min_state_bytes_per_key, state_bytes_per_key);
     const UInt128 state_bytes = static_cast<UInt128>(retained_bytes_per_key) * distinct
-        + static_cast<UInt128>(state_bytes_per_distinct_input) * frozen.getEstimatedDistinctInputCount();
-    return static_cast<UInt128>(frozen.staged_records - distinct) * frozen.staged_bytes
-        > state_bytes * frozen.staged_records * state_cost_multiplier;
-}
+        + static_cast<UInt128>(adaptive_state_bytes_per_distinct_input) * frozen.getEstimatedDistinctInputCount();
 
+    /// The fixed argument area has one width for the whole query. Deriving its size here keeps the
+    /// record writers' accounting limited to keys, variable arguments and bookkeeping. The layout
+    /// counts a shared argument once and excludes arguments stored in their numeric key's bytes.
+    UInt128 staged_bytes = frozen.staged_bytes;
+    if (!is_simple_count && params.aggregates_size)
+        staged_bytes += static_cast<UInt128>(frozen.staged_records) * adaptive_argument_layout->fixed_bytes;
+
+    return static_cast<UInt128>(frozen.staged_records - distinct) * staged_bytes
+        > state_bytes * frozen.staged_records * state_cost_multiplier;
 }
 
 void Aggregator::initAdaptiveSession(AdaptiveAggregationSession & shared) const
@@ -107,9 +110,8 @@ void Aggregator::finishAdaptiveProducer(AggregatedDataVariants & local_variants,
         /// capacity and arena overhead, and remains available if the table is flushed before its producer finishes.
         const auto & frozen = std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase);
         if (adaptiveStagingWastes(
-                frozen,
+                adaptive,
                 frozen.estimated_table_bytes_per_key,
-                adaptive_state_bytes_per_distinct_input,
                 /*state_cost_multiplier=*/1))
             shared.repeat_dominated_producers.fetch_add(1, std::memory_order_relaxed);
     }
@@ -354,9 +356,8 @@ bool Aggregator::adaptiveStagingRepeats(const AdaptiveAggregationProducer & adap
     /// the same hysteresis to the estimated state cost as the calibrated bounds apply to cheap states.
     return adaptiveMayThaw(*adaptive.session)
         && adaptiveStagingWastes(
-            std::get<AdaptiveAggregationProducer::FrozenState>(adaptive.phase),
+            adaptive,
             total_size_of_aggregate_states,
-            adaptive_state_bytes_per_distinct_input,
             adaptive_thaw_state_cost_multiplier);
 }
 

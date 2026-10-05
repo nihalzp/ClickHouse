@@ -95,9 +95,10 @@ constexpr size_t adaptive_frozen_spill_min_hits = 65'536;
 ///
 /// The weighting separates the shapes by how much a repeat costs. With an accurate cardinality estimate,
 /// a near-unique stream has repeat ~ 1 and wasted bytes ~ 0 regardless of the records' size. A stream of
-/// narrow fixed-width records pays ~ 24 bytes per repeat (a numeric key plus the bookkeeping), so it crosses
-/// the bound only past repeat ~ 13, where the pathological mid-cardinality streams live. Wide keys or wide
-/// string arguments pay the whole record per repeat, so ~ 100-byte records cross already at repeat ~ 4.
+/// narrow fixed-width records pays ~ 24 bytes per repeat (a numeric key, a small argument and bookkeeping),
+/// so it crosses the bound only past repeat ~ 13, where the pathological mid-cardinality streams live.
+/// Wide keys or wide arguments pay the whole payload per repeat, so ~ 100-byte records cross already
+/// at repeat ~ 4.
 /// For cheap states, the bound of 300 splits the measured shapes: every shape that wants the thaw wastes
 /// at least ~ 440 bytes per key (a 90-byte string key at repeat ~ 3, a 90-byte string argument at repeat ~ 5,
 /// high-repeat count streams land in the kilobytes), and every shape that wins when kept engaged wastes

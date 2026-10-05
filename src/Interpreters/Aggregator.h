@@ -818,6 +818,10 @@ private:
     /// the query should not engage the adaptive aggregation, or nothing when the run measured nothing.
     std::optional<bool> adaptiveStagingVerdict(const AdaptiveAggregationSession & shared) const;
 
+    /// Compares a frozen producer's repeated staging cost with the states its ordinary table would retain.
+    bool adaptiveStagingWastes(
+        const AdaptiveAggregationProducer & adaptive, size_t state_bytes_per_key, size_t state_cost_multiplier) const;
+
     /// The thaw verdict of a frozen producer, checked between blocks: its own staged stream repeats its misses so much
     /// that its table would do better absorbing them in place (see the tuning constants in `AdaptiveAggregationImpl.h`).
     bool adaptiveStagingRepeats(const AdaptiveAggregationProducer & adaptive) const;

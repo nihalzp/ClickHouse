@@ -1149,13 +1149,14 @@ void NO_INLINE Aggregator::appendDelayedRecords(
     ///   once more (a string min keeps its own copy of the winning value). A repeated key pays
     ///   all of that on every occurrence, where an unfrozen table would have paid a single
     ///   in-place state update, so each repeat of a heavy value is genuine waste.
-    ///   Fixed-width arguments are deliberately not counted because their staging copy is a
-    ///   few bytes and the drain consumes them with the same vectorized batch executor the
-    ///   scan would have used on the original block. Deferring such values moves the work
-    ///   without multiplying it, so their staging costs about what their consumption saves.
-    ///   Charging them would fire the thaw on streams where staging is in fact profitable. The
-    ///   measured anchor is a stream of five UInt64 arguments at repeat 10: it stays a clear
-    ///   adaptive win, and counting its forty fixed bytes per record would have thawed it.
+    ///   Fixed-width arguments also occupy memory until the drain, and rebuilding their dense
+    ///   columns copies them again before the ordinary batch executor consumes them. A repeated
+    ///   key pays these copies on each occurrence, while an ordinary table updates its states in
+    ///   place. Their fixed area is counted by `adaptiveStagingWastes` from the record count and
+    ///   `AdaptiveArgumentLayout::fixed_bytes`. The comparison uses repetition within this producer,
+    ///   since equal keys in different producers would also occupy separate ordinary tables. A
+    ///   stream of five `UInt64` arguments at global repeat 10 can therefore remain profitable when
+    ///   its local streams repeat little.
     /// - The sample receives routing hashes matching `hash & 0xFF == 0`. Each distinct key has the
     ///   same sampling probability, and `distinct_sampled_hashes` collapses its repeats onto one entry.
     ///   For a growing set aggregate, a bounded sketch also counts distinct argument tuples of these
