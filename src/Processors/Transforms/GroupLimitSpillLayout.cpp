@@ -1,4 +1,4 @@
-#include <Processors/Transforms/DistinctSpillLayout.h>
+#include <Processors/Transforms/GroupLimitSpillLayout.h>
 
 #include <algorithm>
 #include <numeric>
@@ -7,7 +7,6 @@
 #include <Columns/ColumnsNumber.h>
 #include <Core/Block.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <Processors/Transforms/DistinctSetFilter.h>
 #include <Common/ColumnsHashing.h>
 
 namespace DB
@@ -16,9 +15,9 @@ namespace DB
 namespace
 {
 
-constexpr auto FINGERPRINT_COLUMN_NAME = "__distinct_fingerprint";
-constexpr auto FLAG_COLUMN_NAME = "__distinct_already_emitted";
-constexpr auto ARRIVAL_NUMBER_COLUMN_NAME = "__distinct_arrival_number";
+constexpr auto FINGERPRINT_COLUMN_NAME = "__key_fingerprint";
+constexpr auto SEEN_ROWS_COLUMN_NAME = "__seen_rows";
+constexpr auto ARRIVAL_NUMBER_COLUMN_NAME = "__arrival_number";
 
 /// Selects the non-constant columns in header order. Constants are restored from the header after
 /// merging, so their values do not need to be written to the temporary runs.
@@ -60,59 +59,60 @@ String uniqueColumnName(const Block & header, String name)
 
 }
 
-DistinctSpillLayout::DistinctSpillLayout(
+GroupLimitSpillLayout::GroupLimitSpillLayout(
     SharedHeader input_header_, const ColumnNumbers & input_key_columns_pos,
-    DistinctKeyRepresentation key_representation_, bool preserve_input_order)
+    SpillKeyRepresentation key_representation_, bool preserve_input_order, DataTypePtr seen_rows_type_)
     : input_header(std::move(input_header_))
     , key_representation(key_representation_)
+    , seen_rows_type(std::move(seen_rows_type_))
     , spill_columns_pos(calculateSpillColumnsPositions(*input_header))
     , key_columns_pos(mapKeysToSpillPositions(input_key_columns_pos, spill_columns_pos))
     , arrival_number_column_pos(preserve_input_order ? std::optional<size_t>{spill_columns_pos.size()} : std::nullopt)
 {
-    Block ordinary;
+    Block input;
     for (const auto pos : spill_columns_pos)
-        ordinary.insert(input_header->getByPosition(pos));
+        input.insert(input_header->getByPosition(pos));
 
     if (preserve_input_order)
     {
         auto type = std::make_shared<DataTypeUInt64>();
-        const auto name = uniqueColumnName(ordinary, ARRIVAL_NUMBER_COLUMN_NAME);
-        ordinary.insert({type->createColumn(), type, name});
+        const auto name = uniqueColumnName(input, ARRIVAL_NUMBER_COLUMN_NAME);
+        input.insert({type->createColumn(), type, name});
         arrival_number_sort_description.emplace_back(name, 1, 1);
     }
-    merged_header = std::make_shared<const Block>(ordinary);
+    merged_header = std::make_shared<const Block>(input);
 
-    Block suppression;
-    if (key_representation == DistinctKeyRepresentation::Hash128)
+    Block seen;
+    if (key_representation == SpillKeyRepresentation::Hash128)
     {
         auto type = std::make_shared<DataTypeUInt128>();
-        ordinary.insert({type->createColumn(), type, uniqueColumnName(ordinary, FINGERPRINT_COLUMN_NAME)});
-        suppression.insert(ordinary.getByPosition(ordinary.columns() - 1));
+        input.insert({type->createColumn(), type, uniqueColumnName(input, FINGERPRINT_COLUMN_NAME)});
+        seen.insert(input.getByPosition(input.columns() - 1));
     }
     else
     {
         for (const auto pos : key_columns_pos)
-            suppression.insert(ordinary.getByPosition(pos));
+            seen.insert(input.getByPosition(pos));
     }
 
-    key_sort_description.reserve(suppression.columns());
-    for (const auto & column : suppression)
+    key_sort_description.reserve(seen.columns());
+    for (const auto & column : seen)
         key_sort_description.emplace_back(column.name, 1, 1);
 
-    auto flag_type = std::make_shared<DataTypeUInt8>();
-    const auto flag_name = uniqueColumnName(ordinary, FLAG_COLUMN_NAME);
-    ordinary.insert({flag_type->createColumn(), flag_type, flag_name});
-    suppression.insert(ordinary.getByPosition(ordinary.columns() - 1));
+    const auto seen_rows_name = uniqueColumnName(input, SEEN_ROWS_COLUMN_NAME);
+    input.insert({seen_rows_type->createColumn(), seen_rows_type, seen_rows_name});
+    seen.insert(input.getByPosition(input.columns() - 1));
 
-    /// Order suppression rows before ordinary rows with equal keys, independently of run registration.
+    /// Order seen rows, whose counts are positive, before input rows with equal keys, independently of run
+    /// registration.
     run_sort_description = key_sort_description;
-    run_sort_description.emplace_back(flag_name, -1, 1);
-    input_run_header = std::make_shared<const Block>(std::move(ordinary));
-    suppression_run_header = std::make_shared<const Block>(std::move(suppression));
+    run_sort_description.emplace_back(seen_rows_name, -1, 1);
+    input_run_header = std::make_shared<const Block>(std::move(input));
+    seen_run_header = std::make_shared<const Block>(std::move(seen));
 }
 
-size_t DistinctSpillLayout::estimateServiceColumnsMemory(
-    size_t num_rows, DistinctKeyRepresentation key_representation, bool preserve_input_order)
+size_t GroupLimitSpillLayout::estimateServiceColumnsMemory(
+    size_t num_rows, SpillKeyRepresentation key_representation, bool preserve_input_order)
 {
     /// These columns are constructed at their final size, so allocation includes padding but no
     /// power-of-two capacity rounding.
@@ -122,7 +122,7 @@ size_t DistinctSpillLayout::estimateServiceColumnsMemory(
         using Array = ColumnUInt64::Container;
         bytes += PODArrayDetails::minimum_memory_for_elements(num_rows, sizeof(UInt64), Array::pad_left, Array::pad_right);
     }
-    if (key_representation == DistinctKeyRepresentation::Hash128)
+    if (key_representation == SpillKeyRepresentation::Hash128)
     {
         using Array = ColumnUInt128::Container;
         bytes += PODArrayDetails::minimum_memory_for_elements(num_rows, sizeof(UInt128), Array::pad_left, Array::pad_right);
@@ -130,7 +130,7 @@ size_t DistinctSpillLayout::estimateServiceColumnsMemory(
     return bytes;
 }
 
-Chunk DistinctSpillLayout::prepareInputChunk(Chunk chunk, UInt64 first_arrival_number) const
+Chunk GroupLimitSpillLayout::prepareInputChunk(Chunk chunk, UInt64 first_arrival_number) const
 {
     const size_t num_rows = chunk.getNumRows();
     auto input_columns = chunk.detachColumns();
@@ -140,7 +140,7 @@ Chunk DistinctSpillLayout::prepareInputChunk(Chunk chunk, UInt64 first_arrival_n
         columns.push_back(std::move(input_columns[pos]));
 
     chunk.setColumns(std::move(columns), num_rows);
-    /// Match the set's normalization before hashing. Fingerprints survive `Native` round trips,
+    /// Match the in-memory filter's normalization before hashing. Fingerprints survive `Native` round trips,
     /// which can change an aggregate state's serialized bytes.
     materializeChunk(chunk);
     columns = chunk.detachColumns();
@@ -152,7 +152,7 @@ Chunk DistinctSpillLayout::prepareInputChunk(Chunk chunk, UInt64 first_arrival_n
         columns.emplace_back(std::move(arrival_numbers));
     }
 
-    if (key_representation == DistinctKeyRepresentation::Hash128)
+    if (key_representation == SpillKeyRepresentation::Hash128)
     {
         ColumnRawPtrs key_columns;
         key_columns.reserve(key_columns_pos.size());
@@ -164,22 +164,23 @@ Chunk DistinctSpillLayout::prepareInputChunk(Chunk chunk, UInt64 first_arrival_n
         columns.emplace_back(std::move(hashes));
     }
 
-    /// The flag stays constant while sorting and deduplication can reduce the chunk's row count.
-    columns.emplace_back(ColumnConst::create(ColumnUInt8::create(1, UInt8{0}), num_rows));
+    /// The seen count stays constant while sorting and group limits can reduce the chunk's row count.
+    columns.emplace_back(seen_rows_type->createColumnConst(num_rows, Field(UInt64{0})));
     chunk.setColumns(std::move(columns), num_rows);
     return chunk;
 }
 
-Chunk DistinctSpillLayout::prepareSuppressionChunk(MutableColumns key_columns) const
+Chunk GroupLimitSpillLayout::prepareSeenChunk(SeenGroups seen) const
 {
-    chassert(key_columns.size() + 1 == suppression_run_header->columns());
-    const size_t num_rows = key_columns.front()->size();
-    Chunk chunk(std::move(key_columns), num_rows);
-    chunk.addColumn(ColumnConst::create(ColumnUInt8::create(1, UInt8{1}), num_rows));
+    chassert(seen.keys.size() + 1 == seen_run_header->columns());
+    const size_t num_rows = seen.keys.front()->size();
+    chassert(seen.seen_rows->size() == num_rows);
+    Chunk chunk(std::move(seen.keys), num_rows);
+    chunk.addColumn(std::move(seen.seen_rows));
     return chunk;
 }
 
-Chunk DistinctSpillLayout::restoreOutputChunk(Chunk chunk) const
+Chunk GroupLimitSpillLayout::restoreOutputChunk(Chunk chunk) const
 {
     if (!arrival_number_column_pos && spill_columns_pos.size() == input_header->columns())
         return chunk;
