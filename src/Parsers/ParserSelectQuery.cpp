@@ -3694,6 +3694,49 @@ This is equivalent to:
 ```sql
 SELECT id, val FROM limit_by ORDER BY id, val LIMIT 2 BY id, val;
 ```
+
+## LIMIT BY in External Memory {#limit-by-in-external-memory}
+
+`LIMIT BY` can write temporary data to disk to process more distinct keys than fit in memory. This requires
+additional disk I/O and can make queries slower.
+
+Two settings control when spilling starts:
+
+- `max_bytes_before_external_limit_by` sets a threshold in bytes of total query memory. It defaults
+  to `0` (disabled).
+- `max_bytes_ratio_before_external_limit_by` sets a fraction of available memory under server or
+  user limits, measured at the start of execution. It defaults to `0.5` and has no effect when
+  neither limit applies.
+
+When both thresholds apply, the smaller is used. Set both settings to `0` to disable spilling.
+
+For example, this query keeps the two largest values of each of one million keys and starts spilling
+once the query uses 16 MiB:
+
+```sql
+SELECT number % 1000000 AS id, number AS val
+FROM numbers(3000000)
+ORDER BY val DESC
+LIMIT 2 BY id
+SETTINGS
+    max_bytes_before_external_limit_by = 16777216,
+    max_bytes_ratio_before_external_limit_by = 0;
+```
+
+These thresholds do not cap memory usage. Leave room for other query processing and the spill
+itself. Spilling may also start earlier under memory pressure.
+
+Rows can be returned before spilling, and a `LIMIT` satisfied at this stage can finish the query early.
+Once spilling starts, the rest of the input must be read before the remaining results can be returned.
+If the query includes `ORDER BY`, spilling keeps the same rows of each key as processing in memory and
+returns the results in the requested order. Otherwise, as in memory, which rows of a key are kept is not
+defined, and the rows returned after spilling starts are grouped by the `LIMIT BY` keys.
+
+When `LIMIT BY` uses input sorted by its keys, it keeps the count of one group at a time and does not
+spill.
+
+Spilling may treat floating-point keys that have different binary representations but compare equal,
+including `0.0` and `-0.0`, or `NaN` values with different payloads, as the same key.
 )DOCS_MD",
         .syntax = R"(
 SELECT ... LIMIT [offset_value, ]n BY expressions ...
