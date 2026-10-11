@@ -1,18 +1,21 @@
-#include <Processors/Merges/Algorithms/DistinctSortedAlgorithm.h>
+#include <Processors/Merges/Algorithms/GroupLimitSortedAlgorithm.h>
 
 #include <algorithm>
+#include <limits>
 
-#include <Columns/ColumnsNumber.h>
-#include <Common/assert_cast.h>
+#include <base/arithmeticOverflow.h>
 
 namespace DB
 {
 
-DistinctSortedAlgorithm::DistinctSortedAlgorithm(
-    SharedHeaders input_headers, SharedHeader output_header_, SortDescription description_, size_t max_block_size_rows_)
+GroupLimitSortedAlgorithm::GroupLimitSortedAlgorithm(
+    SharedHeaders input_headers, SharedHeader output_header_, SortDescription description_,
+    UInt64 group_offset_, UInt64 group_limit_end_, size_t max_block_size_rows_)
     : output_header(std::move(output_header_))
     , description(std::move(description_))
     , num_key_columns(description.size() - 1)
+    , group_offset(group_offset_)
+    , group_limit_end(group_limit_end_)
     , max_block_size_rows(max_block_size_rows_)
     , merged_data(false, max_block_size_rows, 0, std::nullopt)
 {
@@ -22,14 +25,14 @@ DistinctSortedAlgorithm::DistinctSortedAlgorithm(
         addInput(std::move(header));
 }
 
-void DistinctSortedAlgorithm::addInput(SharedHeader header)
+void GroupLimitSortedAlgorithm::addInput(SharedHeader header)
 {
     sources.push_back({std::move(header), {}, {}});
     current_inputs.emplace_back();
     cursors.emplace_back();
 }
 
-void DistinctSortedAlgorithm::initialize(Inputs inputs)
+void GroupLimitSortedAlgorithm::initialize(Inputs inputs)
 {
     chassert(inputs.size() == sources.size());
     DataTypes sort_types;
@@ -71,7 +74,7 @@ void DistinctSortedAlgorithm::initialize(Inputs inputs)
     queue = SortingQueueBatch<SortCursor>(cursors);
 }
 
-void DistinctSortedAlgorithm::consume(Input & input, size_t source_num)
+void GroupLimitSortedAlgorithm::consume(Input & input, size_t source_num)
 {
     auto & source = sources[source_num];
     removeReplicatedFromSortingColumns(source.header, input, description);
@@ -86,7 +89,7 @@ void DistinctSortedAlgorithm::consume(Input & input, size_t source_num)
     queue.push(cursor);
 }
 
-Chunk DistinctSortedAlgorithm::projectOutput(Chunk chunk, size_t source_num) const
+Chunk GroupLimitSortedAlgorithm::projectOutput(Chunk chunk, size_t source_num) const
 {
     const auto num_rows = chunk.getNumRows();
     const auto & columns = chunk.getColumns();
@@ -98,7 +101,7 @@ Chunk DistinctSortedAlgorithm::projectOutput(Chunk chunk, size_t source_num) con
     return chunk;
 }
 
-void DistinctSortedAlgorithm::saveLastKey()
+void GroupLimitSortedAlgorithm::saveLastKey()
 {
     last_key_columns.clear();
     last_key_column_ptrs.clear();
@@ -113,13 +116,20 @@ void DistinctSortedAlgorithm::saveLastKey()
     last_key.row_num = 0;
 }
 
-Chunk DistinctSortedAlgorithm::pull()
+Chunk GroupLimitSortedAlgorithm::pull()
 {
     consumed_rows = 0;
     return merged_data.pull();
 }
 
-IMergingAlgorithm::Status DistinctSortedAlgorithm::merge()
+IMergingAlgorithm::Status GroupLimitSortedAlgorithm::merge()
+{
+    if (group_offset == 0 && group_limit_end == 1)
+        return mergeDistinctRows();
+    return mergeRankedRows();
+}
+
+IMergingAlgorithm::Status GroupLimitSortedAlgorithm::mergeDistinctRows()
 {
     while (queue.isValid())
     {
@@ -136,14 +146,13 @@ IMergingAlgorithm::Status DistinctSortedAlgorithm::merge()
 
         const size_t batch_size = std::min(initial_batch_size, max_block_size_rows - consumed_rows);
         const size_t first_row = current->getRow();
-        const auto & flags = assert_cast<const ColumnUInt8 &>(*current->sort_columns[num_key_columns]).getData();
         detail::RowRef current_key;
         current_key.set(current);
         current_key.num_columns = num_key_columns;
         size_t skipped_rows = batch_size;
-        if (flags[first_row] == 0)
+        if (current->sort_columns[num_key_columns]->getUInt(first_row) == 0)
         {
-            /// Ordinary chunks are internally unique, so only the first row can repeat a prior key,
+            /// Input-row chunks are internally unique, so only the first row can repeat a prior key,
             /// and only when switching chunks. Source refills compare against the saved boundary key.
             skipped_rows = !last_key.empty() && last_key.sort_columns != current_key.sort_columns
                 && last_key.hasEqualSortColumnsWith(current_key);
@@ -178,6 +187,87 @@ IMergingAlgorithm::Status DistinctSortedAlgorithm::merge()
             const size_t source_num = current->order;
             Status status(source_num);
             if (whole_chunk || consumed_rows == max_block_size_rows)
+                status.chunk = pull();
+            return status;
+        }
+        queue.next(batch_size);
+    }
+
+    return Status(pull(), true);
+}
+
+IMergingAlgorithm::Status GroupLimitSortedAlgorithm::mergeRankedRows()
+{
+    while (queue.isValid())
+    {
+        if (consumed_rows == max_block_size_rows)
+            return Status(pull());
+
+        auto [current_ptr, initial_batch_size] = queue.current();
+        auto current = *current_ptr;
+        const size_t batch_size = std::min(initial_batch_size, max_block_size_rows - consumed_rows);
+        const size_t first_row = current->getRow();
+        const IColumn & seen_rows = *current->sort_columns[num_key_columns];
+        const bool is_seen_source = seen_rows.getUInt(first_row) != 0;
+        const IColumn ** key_columns = current->sort_columns.data();
+
+        size_t range_start = first_row;
+        size_t range_length = 0;
+        auto flush_range = [&]
+        {
+            if (range_length == 0)
+                return;
+            merged_data.insertRows(sources[current->order].output_columns, range_start, range_length, current->rows);
+            range_length = 0;
+        };
+
+        for (size_t row = first_row; row < first_row + batch_size; ++row)
+        {
+            /// Equal keys are adjacent in the merged order, so a row continues the last key exactly when it equals
+            /// the previously processed row.
+            const bool same_key = row == first_row
+                ? !last_key.empty() && detail::RowRef::checkEquals(num_key_columns, last_key.sort_columns, last_key.row_num, key_columns, row)
+                : detail::RowRef::checkEquals(num_key_columns, key_columns, row - 1, key_columns, row);
+            if (!same_key)
+                last_key_rank = 0;
+
+            if (is_seen_source)
+            {
+                /// A rank at or past the window end suppresses the rest of the key, so it can saturate.
+                if (common::addOverflow(last_key_rank, seen_rows.getUInt(row), last_key_rank))
+                    last_key_rank = std::numeric_limits<UInt64>::max();
+                continue;
+            }
+
+            if (last_key_rank >= group_offset && last_key_rank < group_limit_end)
+            {
+                if (range_length == 0)
+                    range_start = row;
+                ++range_length;
+            }
+            else
+                flush_range();
+
+            if (last_key_rank != std::numeric_limits<UInt64>::max())
+                ++last_key_rank;
+        }
+        flush_range();
+
+        last_key.set(current);
+        last_key.num_columns = num_key_columns;
+        last_key.row_num = first_row + batch_size - 1;
+        const bool source_exhausted = current->isLast(batch_size);
+        if (source_exhausted)
+        {
+            saveLastKey();
+            queue.removeTop();
+        }
+        consumed_rows += batch_size;
+
+        if (source_exhausted)
+        {
+            Status status(current->order);
+            if (consumed_rows == max_block_size_rows)
                 status.chunk = pull();
             return status;
         }
