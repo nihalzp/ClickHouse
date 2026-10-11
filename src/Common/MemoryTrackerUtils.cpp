@@ -1,10 +1,17 @@
 #include <algorithm>
 #include <limits>
 #include <Common/CurrentThread.h>
+#include <Common/Exception.h>
 #include <Common/Logger.h>
 #include <Common/MemoryTracker.h>
 #include <Common/MemoryTrackerUtils.h>
+#include <Common/formatReadable.h>
 #include <Common/logger_useful.h>
+
+namespace DB::ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+}
 
 std::optional<UInt64> getMostStrictAvailableSystemMemory()
 {
@@ -30,6 +37,47 @@ std::optional<UInt64> getMostStrictAvailableSystemMemory()
     if (available == std::numeric_limits<Int64>::max())
         return {};
     return available;
+}
+
+size_t getMaxBytesBeforeExternalProcessing(
+    size_t max_bytes_before_external,
+    double max_bytes_ratio_before_external,
+    const char * ratio_setting_name,
+    const char * operator_name,
+    const LoggerPtr & log)
+{
+    std::optional<size_t> threshold;
+    if (max_bytes_before_external != 0)
+        threshold = max_bytes_before_external;
+
+    if (max_bytes_ratio_before_external != 0.)
+    {
+        const double ratio = max_bytes_ratio_before_external;
+        if (ratio < 0 || ratio >= 1.)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Setting {} should be >= 0 and < 1 ({})", ratio_setting_name, ratio);
+
+        auto available_system_memory = getMostStrictAvailableSystemMemory();
+        if (available_system_memory.has_value())
+        {
+            /// Zero disables spilling, so an enabled ratio must produce at least a one-byte threshold.
+            const size_t ratio_in_bytes = std::max<size_t>(1, static_cast<size_t>(static_cast<double>(*available_system_memory) * ratio));
+            threshold = threshold ? std::min(*threshold, ratio_in_bytes) : ratio_in_bytes;
+
+            LOG_TRACE(
+                log,
+                "Adjusting memory limit before external {} with {} (ratio: {}, available system memory: {})",
+                operator_name,
+                formatReadableSizeWithBinarySuffix(ratio_in_bytes),
+                ratio,
+                formatReadableSizeWithBinarySuffix(*available_system_memory));
+        }
+        else
+        {
+            LOG_TRACE(log, "No system memory limits configured. Ignoring {}", ratio_setting_name);
+        }
+    }
+
+    return threshold.value_or(0);
 }
 
 std::optional<UInt64> getCurrentQueryHardLimit()
