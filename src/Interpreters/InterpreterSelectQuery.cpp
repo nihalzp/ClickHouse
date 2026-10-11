@@ -3472,12 +3472,21 @@ void InterpreterSelectQuery::executeLimitBy(QueryPlan & query_plan)
 
     const bool always_read_till_end = limitByAlwaysReadsTillEnd(query, context->getSettingsRef());
 
+    auto make_limit_by_step = [&](UInt64 length, UInt64 offset)
+    {
+        auto step = std::make_unique<LimitByStep>(
+            query_plan.getCurrentHeader(), LimitByStep::Settings(context->getSettingsRef()), length, offset, columns,
+            always_read_till_end);
+        /// `LIMIT BY` sits above the `ORDER BY` sorting in the plan: the sorted order has to survive it up to the result.
+        if (query.orderBy())
+            step->preserveInputOrder();
+        return step;
+    };
+
     if (!is_limit_length_negative && !is_limit_offset_negative) [[likely]]
     {
         /// LIMIT N [OFFSET M] BY cols - standard positive case
-        auto limit_by = std::make_unique<LimitByStep>(
-            query_plan.getCurrentHeader(), limit_length, limit_offset, columns, always_read_till_end);
-        query_plan.addStep(std::move(limit_by));
+        query_plan.addStep(make_limit_by_step(limit_length, limit_offset));
     }
     else if (is_limit_length_negative && is_limit_offset_negative)
     {
@@ -3491,11 +3500,7 @@ void InterpreterSelectQuery::executeLimitBy(QueryPlan & query_plan)
         ///   1. LimitByStep(limit=MAX, offset=M) - skip first M per group (only if M > 0)
         ///   2. NegativeLimitByStep(limit=N, offset=0) - take last N from remainder
         if (limit_offset > 0)
-        {
-            auto step1 = std::make_unique<LimitByStep>(
-                query_plan.getCurrentHeader(), std::numeric_limits<UInt64>::max(), limit_offset, columns, always_read_till_end);
-            query_plan.addStep(std::move(step1));
-        }
+            query_plan.addStep(make_limit_by_step(std::numeric_limits<UInt64>::max(), limit_offset));
         auto step2 = std::make_unique<NegativeLimitByStep>(query_plan.getCurrentHeader(), limit_length, 0, columns);
         query_plan.addStep(std::move(step2));
     }
@@ -3508,9 +3513,7 @@ void InterpreterSelectQuery::executeLimitBy(QueryPlan & query_plan)
         auto step1 = std::make_unique<NegativeLimitByStep>(
             query_plan.getCurrentHeader(), std::numeric_limits<UInt64>::max(), limit_offset, columns);
         query_plan.addStep(std::move(step1));
-        auto step2 = std::make_unique<LimitByStep>(
-            query_plan.getCurrentHeader(), limit_length, 0, columns, always_read_till_end);
-        query_plan.addStep(std::move(step2));
+        query_plan.addStep(make_limit_by_step(limit_length, 0));
     }
 }
 

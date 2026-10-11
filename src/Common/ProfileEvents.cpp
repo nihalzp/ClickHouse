@@ -468,6 +468,12 @@
     M(ExternalDistinctTailKeptRows, "Number of buffered rows retained in memory for the final external DISTINCT merge.", ValueType::Number) \
     M(ExternalDistinctCompressedBytes, "Number of compressed bytes written for DISTINCT in external memory.", ValueType::Bytes) \
     M(ExternalDistinctUncompressedBytes, "Amount of data (uncompressed, before compression) written for DISTINCT in external memory.", ValueType::Bytes) \
+    M(ExternalLimitByWritePart, "Number of times a temporary file was written to disk for LIMIT BY in external memory.", ValueType::Number) \
+    M(ExternalLimitByMerge, "Number of times temporary files were merged for LIMIT BY in external memory.", ValueType::Number) \
+    M(ExternalLimitByTailSpilledRows, "Number of buffered rows selected for spilling before the final external LIMIT BY merge.", ValueType::Number) \
+    M(ExternalLimitByTailKeptRows, "Number of buffered rows retained in memory for the final external LIMIT BY merge.", ValueType::Number) \
+    M(ExternalLimitByCompressedBytes, "Number of compressed bytes written for LIMIT BY in external memory.", ValueType::Bytes) \
+    M(ExternalLimitByUncompressedBytes, "Amount of data (uncompressed, before compression) written for LIMIT BY in external memory.", ValueType::Bytes) \
     \
     M(IcebergPartitionPrunedFiles, "Number of skipped files during Iceberg partition pruning", ValueType::Number) \
     M(IcebergPartitionPrunedManifestFiles, "Number of Iceberg manifest files skipped without being read, using the partition summaries of the manifest list", ValueType::Number) \

@@ -212,6 +212,10 @@ static constexpr auto DBMS_MIN_QUERY_PLAN_SERIALIZATION_VERSION_WITH_QUERY_CONDI
 /// rejected: the peer aggregates without the heap and returns partial states for all its groups,
 /// which the initiator's merge, sort and limit handle correctly - the safe direction.
 static constexpr auto DBMS_MIN_QUERY_PLAN_SERIALIZATION_VERSION_WITH_GROUP_BY_TOP_K = 20;
+/// First global query-plan version that writes version 1 of `LimitBy`, adding the
+/// `max_bytes_before_external_limit_by` and `max_bytes_ratio_before_external_limit_by` plan settings
+/// and the input-order flag. Gates writing the settings in `LimitByStep::serializeSettings`.
+static constexpr auto DBMS_MIN_QUERY_PLAN_SERIALIZATION_VERSION_WITH_EXTERNAL_LIMIT_BY = 20;
 /// Version 1 added the initiator's settings changes to the task.
 /// Version 2 added per-stream streaming-exchange ports to exchange_stream_sources.
 /// Version 3 added the error code of a failed task to its status reply.
