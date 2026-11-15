@@ -294,8 +294,9 @@ namespace
 
         /// The record counts of the bucket's partitions, in the producers' chunks and in their spill streams. A
         /// producer keeps the counts of consecutive partitions together, so the producers are read one after another.
-        std::vector<size_t> recordsOfPartitions(size_t partitions) const
+        std::vector<size_t> recordsOfPartitions() const
         {
+            const size_t partitions = session.layout.partitionsPerBucket();
             std::vector<size_t> records(partitions);
             for (size_t sub = 0; sub < partitions; ++sub)
                 records[sub] = spilledOf(sub).recordCount();
@@ -1160,7 +1161,7 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     const size_t partitions_per_bucket = layout.partitionsPerBucket();
 
     AdaptiveBucketRecords staged(session, bucket);
-    const std::vector<size_t> partition_records = staged.recordsOfPartitions(partitions_per_bucket);
+    const std::vector<size_t> partition_records = staged.recordsOfPartitions();
     size_t bucket_records = 0;
     for (size_t sub = 0; sub < partitions_per_bucket; ++sub)
         bucket_records += partition_records[sub];
