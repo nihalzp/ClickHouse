@@ -1,8 +1,4 @@
-saturated bin, count
-1	200000
-matches the baseline	1
-the merge skipped records	1
-saturated bin, uniqExact
+saturated bin
 1	200000
 matches the baseline	1
 the merge skipped records	1

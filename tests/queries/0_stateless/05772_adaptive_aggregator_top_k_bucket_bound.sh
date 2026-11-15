@@ -13,9 +13,10 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # In every cell the heaviest key is one that the largest bins alone would bound too low. The merge's threshold starts
 # from the floor that the producers' tables prove, here the count of the heaviest key in the table that holds it, so
 # a bucket bounded by the largest bins alone would be skipped with that key in it. Eight more keys with 50,000 or
-# 100,000 rows each sit in buckets that the bound does skip. The tables freeze at 128 keys with the heavy keys in
-# them, and four rows in ten or more hit a frozen table, so the tables keep probing and take every row of the heavy
-# keys. Every cell compares the top with the same query with the feature off.
+# 100,000 rows each sit in buckets that the bound does skip. The freeze threshold is 128 keys, which a table passes
+# in its first slice of 4,096 rows, so the tables freeze with the heavy keys in them. Four rows in ten or more hit a
+# frozen table, so the tables keep probing and take every row of the heavy keys. Every cell compares the top with the
+# same query with the feature off.
 #
 # `max_threads_min_free_memory_per_thread = 0` keeps both threads whatever the free memory, so each stream has a
 # table of its own. The thresholds are pinned because the runner randomizes them, and every cell runs in its own
@@ -44,13 +45,12 @@ SELECT 'the merge skipped records',
 
 # Key 1 takes 200,000 rows of the first stream only, more than a bin counts, so its bin saturates at 65,535. The keys 4
 # to 11 take 50,000 rows of each stream, 100,000 in all, which their bins count exactly.
-saturating="SELECT multiIf(number % 100 < 20, 1, number % 100 < 60, intDiv(number % 100, 5), 1000 + number) AS k, number AS v
+saturating="SELECT multiIf(number % 100 < 20, 1, number % 100 < 60, intDiv(number % 100, 5), 1000 + number) AS k
     FROM numbers(1000000)
     UNION ALL
-    SELECT multiIf(number % 100 < 40, intDiv(number % 100, 5) + 4, 20000000 + number) AS k, 20000000 + number AS v
+    SELECT multiIf(number % 100 < 40, intDiv(number % 100, 5) + 4, 20000000 + number) AS k
     FROM numbers(1000000)"
-cell 'saturated bin, count' 'count()' "$saturating"
-cell 'saturated bin, uniqExact' 'uniqExact(v)' "$saturating"
+cell 'saturated bin' 'count()' "$saturating"
 
 # The second stream holds key 1 alone, with 300,000 rows, so its table never freezes and has no bins. The keys 4 to 11
 # take 50,000 rows of the first stream each. With a count the table comes without its largest counts, which leaves

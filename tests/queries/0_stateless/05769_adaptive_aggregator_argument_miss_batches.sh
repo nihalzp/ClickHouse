@@ -6,9 +6,9 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # The frozen kernel of the adaptive aggregator takes a block of argument records in slices of 8,192 rows and stages
 # the misses of each slice. Each cell aggregates two streams of 300,000 rows in blocks of 65,536 rows, eight slices
-# each, with a count among other aggregates, whose records carry arguments. The tables freeze at 128 keys, within
-# their first block, so every later block goes through the frozen kernel. The result matches the same query with
-# the feature off.
+# each, with a count among other aggregates, whose records carry arguments. The freeze threshold is 128 keys, which
+# a table passes in its first slice of 4,096 rows, so the tables freeze within their first block and every later
+# block goes through the frozen kernel. The result matches the same query with the feature off.
 # `max_threads_min_free_memory_per_thread = 0` keeps both threads whatever the free memory, so each stream has a
 # table of its own. The thresholds are pinned because the runner randomizes them, and every cell runs in its own
 # clickhouse-local process, so the counters in `system.events` belong to it alone.
@@ -37,7 +37,8 @@ SELECT ${fact};
 }
 
 # Keys that never repeat: no row hits a frozen table, so both tables stop probing after their first 65,536 frozen
-# rows, and the later blocks take the kernel without the probe. Every row past the first 128 of a stream is staged.
+# rows, and the later blocks take the kernel without the probe. Every row past the first 4,096 of a stream is
+# staged.
 cell 'number' "'slices without the probe', bypasses = 2 AND staged >= 2 * (300000 - 8192)"
 
 # Every even row takes one of 50 keys, which the tables learn at once, and every odd row a key of its own. Half of

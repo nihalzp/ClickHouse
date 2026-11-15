@@ -34,10 +34,13 @@ SELECT ${fact};
 "
 }
 
-# Keys that never repeat, with 60,000 rows per stream: each table freezes at the end of its trial, or one block
+# Keys that never repeat, with 200,000 rows per stream: each table freezes at the end of its trial, or one block
 # later, so it stages all but at most 8,192 of its rows. A table that learned up to the threshold of 16,384 keys
-# would stage at most 43,616 of them.
-cell 60000 'number' "'tables froze after the trial', freezes = 2 AND staged >= 2 * (60000 - 8192)"
+# would stage at most 183,616 of them. The streams are long so that the freeze pays however far the reading runs
+# ahead of the aggregation: the rows expected are estimated from the share of the input read so far, and with
+# 400,000 rows to read the estimate still passes the 12,288 rows that a producer needs when 30 blocks are read
+# and not yet aggregated.
+cell 200000 'number' "'tables froze after the trial', freezes = 2 AND staged >= 2 * (200000 - 8192)"
 
 # The same keys with 5,000 rows per stream: a producer that took its trial expects at most the 10,000 rows of both
 # streams, fewer than the 4,096 it received plus 8,192, so no table freezes, and none reaches the threshold either.

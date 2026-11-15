@@ -11,14 +11,15 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # `n` groups reach.
 #
 # Each cell aggregates two streams of 400,000 rows, one per producer. Five heavy keys take 10, 8, 6, 4 and 2 percent
-# of the rows of each stream, and every other row has a key of its own. The tables freeze at 128 keys, within the
-# first 200 rows of their streams, with the heavy keys in them. Three rows in ten hit a frozen table, so the tables
-# keep probing and take every row of the heavy keys: each table ranks them 40,000, 32,000, 24,000, 16,000 and 8,000,
-# and each producer stages about 280,000 records of the other keys. With `LIMIT 3` the floor is 24,000, the third
-# largest rank of a table. A bin without a heavy key holds a few records of both streams, far below the floor, so the
-# merge skips it from its first unit on, and drains only the few records that share a bin with a heavy key: fewer
-# than a thousandth of the staged ones. A merge that started without a floor would drain the buckets that it merges
-# before it knows three ranks, each of them 1/256 of the staged records.
+# of the rows of each stream, and every other row has a key of its own. The freeze threshold is 128 keys, which a
+# table passes in its first slice of 4,096 rows, so each table freezes after 4,096 rows with the heavy keys in it.
+# Three rows in ten hit a frozen table, so the tables keep probing and take every row of the heavy keys: each table
+# ranks them 40,000, 32,000, 24,000, 16,000 and 8,000, and each producer stages about 277,000 records of the other
+# keys. With `LIMIT 3` the floor is 24,000, the third largest rank of a table. A bin without a heavy key holds a few
+# records of both streams, far below the floor, so the merge skips it from its first unit on, and drains only the
+# few records that share a bin with a heavy key: fewer than a thousandth of the staged ones. A merge that started
+# without a floor would drain the buckets that it merges before it knows three ranks, each of them 1/256 of the
+# staged records.
 #
 # `max_threads_min_free_memory_per_thread = 0` keeps both threads whatever the free memory, so each stream has a
 # table of its own. The thresholds are pinned because the runner randomizes them, and every cell runs in its own

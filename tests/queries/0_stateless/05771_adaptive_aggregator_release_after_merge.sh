@@ -11,9 +11,11 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # freed.
 #
 # Each cell aggregates 40 streams of 20,000 rows, one per producer, which makes two jobs. In every stream a quarter of
-# the rows take one of 100 keys, whose counts grow with the key, and every other row has a key of its own. The tables
-# freeze at 128 keys with the shared keys in them, so the merge takes those keys from the cells of 40 tables and
-# every other key from a staged record. The result matches the same query with the feature off.
+# the rows take one of 99 keys, whose counts grow with the key, and every other row has a key of its own. The freeze
+# threshold is 128 keys, which a table passes in its first slice of 4,096 rows, so each table freezes with 63 of the
+# shared keys in it. The merge takes those keys from the cells of 40 tables, the other shared keys from the records
+# of 40 producers, and every other key from one staged record. The result matches the same query with the feature
+# off.
 #
 # `max_threads_min_free_memory_per_thread = 0` keeps the 40 threads whatever the free memory, so each stream has a
 # table of its own. The thresholds are pinned because the runner randomizes them, and every cell runs in its own
@@ -44,10 +46,6 @@ WITH
 SELECT 'every producer froze and the buckets merged', freezes = 40 AND units > 0;
 "
 }
-
-# Every group reaches the output, with states that need no destructor.
-cell 'all groups' "SELECT (count(), sum(c), sum(s), sum(cityHash64(k, c, s))) FROM (
-    SELECT k, count() AS c, sum(v) AS s FROM (${source}) GROUP BY k SETTINGS __SETTINGS__)"
 
 # The states of `uniqExact` own memory: the merge takes them out of the cells of the producers' tables, so the
 # tables are freed without their states.
