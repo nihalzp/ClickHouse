@@ -74,6 +74,12 @@ constexpr size_t adaptive_argument_staging_batch_rows = 1024;
 /// large, so the kept keys of a whole block could take as much memory as its records. Bounded, they are a small scratch
 /// per producer, which the writer reads back from the cache.
 constexpr size_t adaptive_miss_batch_max_key_bytes = 256 << 10;
+/// The frozen kernel of argument records takes a block in slices of this many rows and stages the misses of each (see
+/// `Aggregator::executeFrozenImpl`). The staging reads the descriptors of the misses back, their hashes, source rows
+/// and keys, and gathers their arguments. A block of 65,536 rows that mostly misses leaves about 2 MiB of descriptors
+/// with a 16-byte key, more than a core keeps in its cache beside the frozen table and the append positions, so the
+/// staging would read them from memory. The misses of a slice take a few hundred kilobytes.
+constexpr size_t adaptive_argument_miss_batch_rows = 8'192;
 /// Fixed lookahead of the drain's hash prefetch.
 constexpr size_t adaptive_drain_prefetch_look_ahead = 16;
 /// How much of the next range a walk over staged records requests into L2 as it enters a range: a page,

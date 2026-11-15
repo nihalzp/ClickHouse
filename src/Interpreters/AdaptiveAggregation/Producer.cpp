@@ -563,12 +563,13 @@ void NO_INLINE Aggregator::executeFrozenImpl(
         return;
     }
 
-    /// The probe/staging loop of argument records, shared by the shape that records the places of the hits and the
-    /// bypassed probe, which has no hits and so skips the allocation of the places and the per-row stores.
-    auto probe_rows = [&]<bool record_places>(AggregateDataPtr * places_data) -> size_t
+    /// The probe loop of argument records over the rows [begin, end), shared by the shape that records the places of
+    /// the hits and the bypassed probe, which has no hits and so skips the allocation of the places and the per-row
+    /// stores.
+    auto probe_rows = [&]<bool record_places>(size_t begin, size_t end, AggregateDataPtr * places_data) -> size_t
     {
         size_t hits = 0;
-        for (size_t i = row_begin; i < row_end; ++i)
+        for (size_t i = begin; i < end; ++i)
         {
             auto && key_holder = local_find_state.getKeyHolder(i, scratch_pool);
             const auto & key = keyHolderGetKey(key_holder);
@@ -599,12 +600,24 @@ void NO_INLINE Aggregator::executeFrozenImpl(
         return hits;
     };
 
+    /// Probes the block in slices and stages the misses of each slice while their descriptors are in the cache (see
+    /// `adaptive_argument_miss_batch_rows`). Returns the hits.
+    const auto probe_and_stage = [&]<bool record_places>(AggregateDataPtr * places_data) -> size_t
+    {
+        size_t hits = 0;
+        for (size_t begin = row_begin; begin < row_end; begin += adaptive_argument_miss_batch_rows)
+        {
+            const size_t end = std::min(begin + adaptive_argument_miss_batch_rows, row_end);
+            hits += probe_rows.template operator()<record_places>(begin, end, places_data);
+            stage_misses();
+        }
+        return hits;
+    };
+
     /// With the probe bypassed there is no hit, so there are no places to record.
     if (bypass_local_probe)
     {
-        const size_t hits = probe_rows.template operator()<false>(nullptr);
-        record_local_probes(hits, row_end - row_begin);
-        stage_misses();
+        record_local_probes(probe_and_stage.template operator()<false>(nullptr), row_end - row_begin);
         return;
     }
 
@@ -617,9 +630,8 @@ void NO_INLINE Aggregator::executeFrozenImpl(
     };
     std::unique_ptr<AggregateDataPtr[], decltype(places_deleter)> places(allocator.allocate(places_size), places_deleter);
 
-    const size_t hits = probe_rows.template operator()<true>(places.get());
+    const size_t hits = probe_and_stage.template operator()<true>(places.get());
     record_local_probes(hits, row_end - row_begin);
-    stage_misses();
 
     /// With no local hits every place is null and the batch pass would only skip rows; the
     /// staged records carry the block's whole contribution.
