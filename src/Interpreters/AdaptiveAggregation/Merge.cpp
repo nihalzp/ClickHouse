@@ -732,7 +732,7 @@ size_t NO_INLINE Aggregator::countPartitionGroups(
 
 ALWAYS_INLINE void Aggregator::discardAdaptiveSourceState(AggregateDataPtr & place) const
 {
-    if (!is_simple_count && !all_aggregates_has_trivial_destructor)
+    if (adaptiveSourceStatesHaveDestructors())
         for (size_t i = 0; i < params.aggregates_size; ++i)
             aggregate_functions[i]->destroy(place + offsets_of_aggregate_states[i]);
     place = nullptr;
@@ -1256,7 +1256,7 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
             /// States without destructors leave nothing to do in the source cells, which no one reads again.
             if constexpr (MapAggregationMethod<Method>)
             {
-                if (!is_simple_count && !all_aggregates_has_trivial_destructor)
+                if (adaptiveSourceStatesHaveDestructors())
                     for_each_cell([&](const auto &, AggregateDataPtr * mapped, size_t) { discardAdaptiveSourceState(*mapped); });
             }
             staged.release(unit_first_sub, unit_end_sub);
