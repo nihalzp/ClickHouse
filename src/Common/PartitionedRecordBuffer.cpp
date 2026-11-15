@@ -22,12 +22,17 @@ namespace ErrorCodes
 
 struct alignas(CH_CACHE_LINE_SIZE) PartitionedRecordBuffer::Block
 {
-    explicit Block(size_t bytes_) : bytes(bytes_) {}
+    Block(size_t bytes_, std::atomic<size_t> & live_allocations_) : bytes(bytes_), live_allocations(live_allocations_)
+    {
+        live_allocations.fetch_add(1, std::memory_order_relaxed);
+    }
 
     /// One reference for the carver while it carves from the block, and one per chunk carved and not yet released.
     std::atomic<UInt32> references{1};
     /// The size of the block's allocation. Blocks differ in size, since the blocks of a group grow.
     const size_t bytes;
+    /// The count of the owning buffer's live allocations (see `PartitionedRecordBuffer::live_allocations`).
+    std::atomic<size_t> & live_allocations;
 
     /// Counts a chunk carved from the block. Only the appending thread changes the count while it appends: consumers
     /// release chunks after `finishAppending`, and appends resume once they finish. So the count takes no locked
@@ -39,6 +44,7 @@ struct alignas(CH_CACHE_LINE_SIZE) PartitionedRecordBuffer::Block
         if (references.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
             const size_t allocated = bytes;
+            live_allocations.fetch_sub(1, std::memory_order_release);
             this->~Block();
             Allocator<false, false>().free(this, allocated, alignof(Block));
         }
@@ -67,9 +73,15 @@ PartitionedRecordBuffer::~PartitionedRecordBuffer()
 
 void PartitionedRecordBuffer::clear()
 {
-    for (size_t partition = 0; partition < num_partitions; ++partition)
-        releasePartition(partition);
+    /// The carvers drop their claims first, so only chunks hold the blocks. Every chunk is either carved from a block
+    /// or allocated on its own, and both count as live allocations. With none left, no partition holds a chunk: the
+    /// consumers released them all, which also reset their chains and cursors. The walk over the partitions is then
+    /// skipped. It matters because the buffers of many producers with thousands of partitions each are destroyed by
+    /// one thread after the merge.
     releaseCurrentBlocks();
+    if (live_allocations.load(std::memory_order_acquire))
+        for (size_t partition = 0; partition < num_partitions; ++partition)
+            releasePartition(partition);
     for (auto & carver : carvers)
         carver.allocated_block_bytes = 0;
     allocated_chunk_bytes = 0;
@@ -122,6 +134,7 @@ void PartitionedRecordBuffer::startChunk(size_t partition, size_t bytes)
     {
         capacity = needed;
         data = static_cast<char *>(Allocator<false, false>().alloc(capacity));
+        live_allocations.fetch_add(1, std::memory_order_relaxed);
     }
     else
     {
@@ -134,7 +147,7 @@ void PartitionedRecordBuffer::startChunk(size_t partition, size_t bytes)
             char * memory = static_cast<char *>(Allocator<false, false>().alloc(block_size, alignof(Block)));
             if (carver.block)
                 carver.block->release();
-            carver.block = new (memory) Block(block_size);
+            carver.block = new (memory) Block(block_size, live_allocations);
             carver.pos = memory + sizeof(Block);
             carver.remaining = block_size - sizeof(Block);
             carver.allocated_block_bytes += block_size;
@@ -199,7 +212,10 @@ void PartitionedRecordBuffer::releasePartition(size_t partition)
             }
         }
         else
+        {
             Allocator<false, false>().free(chunk, chunk->capacity);
+            live_allocations.fetch_sub(1, std::memory_order_release);
+        }
         chunk = next;
     }
     for (size_t i = 0; i < batched; ++i)

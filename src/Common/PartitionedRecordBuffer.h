@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -152,6 +153,10 @@ private:
     std::unique_ptr<Chain[]> chains;
     std::vector<Carver> carvers;
     size_t allocated_chunk_bytes = 0;
+    /// The blocks and the chunks allocated on their own that are not freed yet. The appending thread adds them, and
+    /// the consumers subtract a block when its last chunk is released, which happens once per block rather than once
+    /// per partition. `clear` skips its walk over the partitions when none is left.
+    std::atomic<size_t> live_allocations{0};
 };
 
 /// The head of every chunk: the next chunk of the partition, the block it was carved from (null for a chunk

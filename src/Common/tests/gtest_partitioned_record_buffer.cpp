@@ -172,6 +172,51 @@ TEST(PartitionedRecordBuffer, ReleaseAndResumeAppending)
     EXPECT_EQ(buffer.recordsOf(1), 1);
 }
 
+/// `clear` frees the chunks that the consumers left, and skips its walk over the partitions when they left none.
+/// Either way the buffer holds no chunk afterwards and takes appends again.
+TEST(PartitionedRecordBuffer, ClearAfterConsumersReleased)
+{
+    runTracked([](const MemoryTracker & tracker)
+    {
+        constexpr size_t partitions = 4;
+        PartitionedRecordBuffer buffer(partitions, 2);
+        const Int64 empty = tracker.get();
+        /// Partition 0 takes a chunk carved from the block of its group, partition 1 a chunk of its own, and
+        /// partition 3 a chunk from the block of the other group.
+        const auto fill = [&]
+        {
+            appendRecord(buffer, 0, "carved");
+            appendRecord(buffer, 1, std::string(10000, 'x'));
+            appendRecord(buffer, 3, "other group");
+            buffer.finishAppending();
+        };
+
+        /// The consumers release every partition, which frees every block, so `clear` has nothing to walk.
+        fill();
+        EXPECT_GT(tracker.get(), empty);
+        for (size_t partition = 0; partition < partitions; ++partition)
+            buffer.releasePartition(partition);
+        EXPECT_EQ(tracker.get(), empty);
+        buffer.clear();
+        EXPECT_EQ(buffer.allocatedChunkBytes(), 0);
+
+        /// The consumers leave a carved chunk and a chunk of its own, and `clear` frees both.
+        fill();
+        buffer.releasePartition(3);
+        EXPECT_GT(tracker.get(), empty);
+        buffer.clear();
+        EXPECT_EQ(tracker.get(), empty);
+        EXPECT_EQ(buffer.allocatedChunkBytes(), 0);
+        for (size_t partition = 0; partition < partitions; ++partition)
+            EXPECT_EQ(buffer.recordsOf(partition), 0);
+
+        appendRecord(buffer, 1, "reused");
+        buffer.finishAppending();
+        EXPECT_EQ(readPartition(buffer, 1), "reused");
+        EXPECT_EQ(buffer.recordsOf(1), 1);
+    });
+}
+
 TEST(PartitionedRecordBuffer, ConcurrentPartitionRelease)
 {
     constexpr size_t partitions = 33;
