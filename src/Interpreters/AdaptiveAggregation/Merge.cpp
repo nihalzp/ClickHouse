@@ -480,6 +480,31 @@ namespace
         std::vector<std::vector<RoutedCell>> routed;
     };
 
+    /// Joins the chunks of the units of a bucket into the first of them. The merge sources hand their chunks to one
+    /// processor, which forwards them one at a time, and a source takes its next bucket only after its chunks are
+    /// gone. So a chunk per unit, thousands of them in a large aggregation, makes the merge tasks wait for that
+    /// processor, and the chunks of a top-K hold only a few rows each. The values are final, so the rows are copied.
+    void joinUnitChunks(DB::Aggregator::AggregatedChunks & chunks)
+    {
+        if (chunks.size() <= 1)
+            return;
+        size_t rows = 0;
+        for (const auto & unit : chunks)
+            rows += unit.chunk.getNumRows();
+        auto & joined = chunks.front().chunk;
+        auto columns = joined.mutateColumns();
+        for (auto & column : columns)
+            column->reserve(rows);
+        for (auto unit = std::next(chunks.begin()); unit != chunks.end(); ++unit)
+        {
+            const auto & unit_columns = unit->chunk.getColumns();
+            for (size_t i = 0; i < columns.size(); ++i)
+                columns[i]->insertRangeFrom(*unit_columns[i], 0, unit->chunk.getNumRows());
+        }
+        joined.setColumns(std::move(columns), rows);
+        chunks.erase(std::next(chunks.begin()), chunks.end());
+    }
+
     /// Decodes the variable-size arguments of argument records of `format` into one column per variable field of
     /// `layout`, in the order of the records. The values of a record follow its key: a `String` as `writeStagedString`
     /// staged it, appended without a read buffer or a virtual call, and another value in its column's own serialization.
@@ -1351,6 +1376,9 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     /// destination.
     arena_slot.reset();
     ProfileEvents::increment(ProfileEvents::AdaptiveAggregationBucketsRetired);
+    /// Partial results keep a chunk per unit: joining aggregate states would copy them one by one.
+    if (final)
+        joinUnitChunks(chunks);
     return chunks;
 }
 
