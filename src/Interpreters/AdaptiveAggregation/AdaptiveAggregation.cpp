@@ -13,7 +13,6 @@
 #include <Interpreters/Aggregator.h>
 #include <Interpreters/HashTablesStatistics.h>
 #include <Interpreters/ProcessList.h>
-#include <base/sort.h>
 
 namespace ProfileEvents
 {
@@ -385,27 +384,23 @@ void Aggregator::finishAdaptiveProducer(AggregatedDataVariants & local_variants,
     std::array<UInt64, ADAPTIVE_AGGREGATION_NUM_BUCKETS> max_count_per_bucket_storage{};
     auto * const max_count_per_bucket = !count_bins && adaptiveTopKPrunesWithoutFreeze() ? &max_count_per_bucket_storage : nullptr;
 
-    /// A descending top-K takes a floor from the producer's own table: the rank of a group in the table counts only
-    /// what this producer aggregated into it, so the group's final rank is at least that, and the
-    /// `bucket_top_k`-th largest rank of the table is one that `bucket_top_k` groups reach. For example, with a top
-    /// 10 by `count`, a table whose tenth largest count is 500 proves that ten groups have 500 rows or more. The
-    /// merge's threshold starts from the largest floor of the producers instead of zero, so the units that every
-    /// merge task merges first, before any unit is converted, already skip the count bins bounded below it.
-    PaddedPODArray<UInt64> rank_counts;
-    const bool finds_top_k_floor = params.bucket_top_k && !params.bucket_top_k_ascending;
+    /// A descending top-K takes a floor from the producer's own table: the threshold of the table's own ranks, the
+    /// worst of its `bucket_top_k` best. The rank of a group in the table counts only what this producer aggregated
+    /// into it, so the group's final rank is at least that, and `bucket_top_k` groups reach the table's threshold.
+    /// For example, with a top 10 by `count`, a table whose tenth largest count is 500 proves that ten groups have
+    /// 500 rows or more. The merge's threshold starts from the largest floor of the producers instead of zero, so the
+    /// units that every merge task merges first, before any unit is converted, already skip the count bins bounded
+    /// below it. A table with fewer than `bucket_top_k` groups leaves its threshold at zero, which is no floor.
+    std::optional<AdaptiveTopKThreshold> table_threshold;
+    if (params.bucket_top_k && !params.bucket_top_k_ascending)
+        table_threshold.emplace(params.bucket_top_k, /*ascending_=*/false, /*best_possible_rank_=*/std::nullopt);
 
     size_t estimated_merge_work = adaptive.total_staged_records * adaptive_parallel_merge_indices.size();
-    if (count_bins || max_count_per_bucket || finds_top_k_floor || !adaptive_parallel_merge_indices.empty())
+    if (count_bins || max_count_per_bucket || table_threshold || !adaptive_parallel_merge_indices.empty())
         estimated_merge_work += collectAdaptiveTableStatistics(
-            local_variants, count_bins, max_count_per_bucket, finds_top_k_floor ? &rank_counts : nullptr);
+            local_variants, count_bins, max_count_per_bucket, table_threshold ? &*table_threshold : nullptr);
 
-    UInt64 top_k_floor = 0;
-    if (rank_counts.size() >= params.bucket_top_k)
-    {
-        const auto floor = rank_counts.begin() + (params.bucket_top_k - 1);
-        ::nth_element(rank_counts.begin(), floor, rank_counts.end(), std::greater<>());
-        top_k_floor = *floor;
-    }
+    const UInt64 top_k_floor = table_threshold ? table_threshold->current() : 0;
 
     std::optional<AdaptiveTopKPruning::ProducerBins> bins;
     if (count_bins)

@@ -288,9 +288,9 @@ struct AdaptiveAggregationSession
     size_t table_cells = 0;
 
     /// A rank that `bucket_top_k` groups of a descending top-K are known to reach, the floor that the merge's
-    /// threshold starts from (see `AdaptiveTopKThreshold`): the largest of the producers' floors, each the
-    /// `bucket_top_k`-th largest rank among the groups of the producer's own table (see
-    /// `Aggregator::finishAdaptiveProducer`). Published under the same mutex.
+    /// threshold starts from (see `AdaptiveTopKThreshold`): the largest of the producers' floors, each the threshold
+    /// of the ranks of the producer's own table (see `Aggregator::finishAdaptiveProducer`). Published under the same
+    /// mutex.
     UInt64 top_k_floor = 0;
 
     /// The staged records the producers spilled over the external-aggregation threshold (see
