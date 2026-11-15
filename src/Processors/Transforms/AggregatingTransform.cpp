@@ -343,7 +343,8 @@ public:
         /// `next_bucket_to_merge`), merged without a cancellation. Each takes the states out of the cells of the source
         /// tables that belong to it, so once all of them merged, the source tables hold no states, and the last one stops
         /// the tables owning states. Their destruction then frees their buffers without walking their cells, which one
-        /// thread would otherwise do for every table at the end of the query. A cancelled merge leaves the tables to
+        /// thread would otherwise do for every table at the end of the query. The adaptive merge frees the tables right
+        /// then, in parallel (see `Aggregator::releaseAdaptiveMergeSources`). A cancelled merge leaves the tables to
         /// destroy the states they keep.
         std::atomic<size_t> merged_claims = 0;
 
@@ -487,9 +488,8 @@ protected:
 
             params->aggregator.checkMergedGroupLimit(shared_data->two_level_merged_groups, merged_group_count);
             shared_data->is_bucket_processed[bucket_num] = true;
-            /// The first variants are the destination, which keeps its states.
             if (shared_data->merged_claims.fetch_add(1) + 1 == ConvertingAggregatedToChunksWithMergingSource::NUM_BUCKETS)
-                params->aggregator.resetAggregatorExceptFirst(*data);
+                params->aggregator.releaseAdaptiveMergeSources(*data, *session);
 
             for (auto & agg_chunk : agg_chunks)
                 chunks.push_back(convertToChunk(std::move(agg_chunk)));
@@ -2027,6 +2027,10 @@ void AggregatingTransform::initGenerate()
         {
             AdaptiveAggregationSession * session = adaptive_context ? adaptive_context->session.get() : nullptr;
             auto prepared_data = params->aggregator.prepareVariantsToMerge(std::move(many_data->variants), session);
+            /// The adaptive bucket merge frees the tables of the producers itself, in parallel, once its last bucket
+            /// merged (see `Aggregator::releaseAdaptiveMergeSources`), so it holds the only references to them.
+            if (bucket_merge)
+                many_data->variants.clear();
             auto prepared_data_ptr = std::make_shared<ManyAggregatedDataVariants>(std::move(prepared_data));
             /// The producers of the session estimated the merge work, also when none of them froze and the tables merge
             /// partition by partition.

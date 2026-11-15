@@ -530,6 +530,15 @@ public:
     /// states have destructors it first walks all their cells for states to destroy, although every cell is empty.
     void releaseAdaptiveMergeTable(ManyAggregatedDataVariants & data, const AdaptiveMergeTask & task) const;
 
+    /// Ends the sources of an adaptive in-memory merge of `data` once every bucket merged, and frees what the producers
+    /// left: the source tables with their cell indexes and arenas, the staging buffers and the count bins of the top-K
+    /// pruning. Every bucket took the states out of its source cells, so the source tables stop owning states and
+    /// their destruction only frees memory. The caller guarantees that `data` holds the only references to the
+    /// source tables, and that no merge task reads the sources any more. With many producers the work is spread over
+    /// the thread pool: one thread would otherwise free everything at the end of the query, which with 192 producers
+    /// takes several milliseconds.
+    void releaseAdaptiveMergeSources(ManyAggregatedDataVariants & data, AdaptiveAggregationSession & session) const;
+
     /// The destination of the adaptive merge: an empty two-level variants of the aggregation's method with an arena slot
     /// per bucket, which holds the arena in which the merge creates the states of the bucket's unit. For a merge that goes
     /// external because producers wrote tables to disk (on the baseline path, or frozen ones), the staged records

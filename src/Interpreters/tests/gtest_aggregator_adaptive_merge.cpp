@@ -15,9 +15,11 @@
 #include <IO/WriteHelpers.h>
 
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 using namespace DB;
 
@@ -306,6 +308,87 @@ TEST(AggregatorAdaptiveMergeTask, FreesItsTableAtTheEnd)
         aggregator.releaseAdaptiveMergeTable(prepared, task);
         EXPECT_LT(tracker.get(), with_table);
     }).join();
+}
+
+/// Once every bucket of an in-memory merge has merged, what the producers left is freed: the source tables, their
+/// arenas in the destination, the staging buffers and the count bins. Each of the 40 producers learns key 0 from its
+/// first row and stages the keys 1 to 100, so key 0 merges from 40 source cells and every other key from 40 staged
+/// records. Forty producers make two release jobs, so a thread of the pool takes one of them. The test drops its own
+/// references to the source tables, as the transform that starts the merge does, so the release destroys them.
+TEST(AggregatorAdaptiveMergeRelease, FreesWhatTheProducersLeft)
+{
+    MainThreadStatus::getInstance();
+    tryRegisterAggregateFunctions();
+
+    const auto number = std::make_shared<DataTypeUInt64>();
+    const AggregateDescriptions aggregates{makeAggregate("count", {}, {}), makeAggregate("sum", {"n"}, {number})};
+    const Block header({{number->createColumn(), number, "k"}, {number->createColumn(), number, "n"}});
+    Aggregator aggregator(header, makeAdaptiveParams({"k"}, aggregates));
+
+    constexpr size_t producers = 40;
+    constexpr size_t staged_keys = 100;
+    auto session = aggregator.createAdaptiveSession(producers);
+    ManyAggregatedDataVariants sources;
+    std::vector<std::weak_ptr<AggregatedDataVariants>> source_tables;
+    for (size_t i = 0; i < producers; ++i)
+    {
+        auto source = std::make_shared<AggregatedDataVariants>();
+        AdaptiveAggregationProducer producer(session);
+        ColumnRawPtrs key_columns(1);
+        Aggregator::AggregateColumns aggregate_columns(aggregates.size());
+        auto key = ColumnUInt64::create();
+        auto value = ColumnUInt64::create();
+        for (size_t k = 0; k <= staged_keys; ++k)
+        {
+            key->insertValue(k);
+            value->insertValue(k);
+        }
+        bool no_more_keys = false;
+        ASSERT_TRUE(aggregator.executeOnBlock(
+            {std::move(key), std::move(value)}, 0, staged_keys + 1, *source, key_columns, aggregate_columns, no_more_keys, &producer));
+        ASSERT_TRUE(producer.isFrozen());
+        aggregator.finishAdaptiveProducer(*source, producer);
+        source_tables.push_back(source);
+        sources.push_back(std::move(source));
+    }
+
+    aggregator.prepareAdaptiveTopK(*session, sources.size(), /*external_merge=*/false, /*collects_statistics=*/false);
+    auto prepared = aggregator.prepareVariantsToMerge(std::move(sources), session.get());
+    sources.clear();
+    ASSERT_EQ(prepared.size(), producers + 1);
+    EXPECT_EQ(session->producer_buffers.size(), producers);
+
+    AdaptiveMergeTask task;
+    std::atomic<bool> cancelled{false};
+    std::map<UInt64, std::pair<UInt64, UInt64>> groups;
+    for (size_t bucket = 0; bucket < ADAPTIVE_AGGREGATION_NUM_BUCKETS; ++bucket)
+    {
+        const auto chunks = aggregator.mergeAndConvertAdaptiveBucket(
+            prepared, *session, task, /*final=*/true, static_cast<Int32>(bucket), aggregator.parallelMergeThreshold(session.get()),
+            cancelled, /*updater=*/nullptr, /*merged_group_count=*/nullptr);
+        for (const auto & converted : chunks)
+        {
+            const auto & columns = converted.chunk.getColumns();
+            for (size_t row = 0; row < converted.chunk.getNumRows(); ++row)
+                groups[columns[0]->getUInt(row)] = {columns[1]->getUInt(row), columns[2]->getUInt(row)};
+        }
+    }
+
+    /// Every producer adds one row of every key.
+    ASSERT_EQ(groups.size(), staged_keys + 1);
+    for (const auto & [key, count_and_sum] : groups)
+        EXPECT_EQ(count_and_sum, std::make_pair(UInt64{producers}, key * producers)) << key;
+
+    for (const auto & table : source_tables)
+        EXPECT_FALSE(table.expired());
+
+    aggregator.releaseAdaptiveMergeSources(prepared, *session);
+    for (const auto & table : source_tables)
+        EXPECT_TRUE(table.expired());
+    for (size_t i = 1; i < prepared.size(); ++i)
+        EXPECT_EQ(prepared[i], nullptr) << i;
+    EXPECT_EQ(prepared[0]->aggregates_pools.size(), 1);
+    EXPECT_TRUE(session->producer_buffers.empty());
 }
 
 /// A block whose keys are all constant reads its one key for every row. Each producer learns key `a` from its first
