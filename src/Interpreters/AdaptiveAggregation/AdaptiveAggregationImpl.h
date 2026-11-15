@@ -82,7 +82,9 @@ constexpr size_t adaptive_miss_batch_max_key_bytes = 256 << 10;
 /// `Aggregator::executeFrozenImpl`). The staging reads the descriptors of the misses back, their hashes, source rows
 /// and keys, and gathers their arguments. A block of 65,536 rows that mostly misses leaves about 2 MiB of descriptors
 /// with a 16-byte key, more than a core keeps in its cache beside the frozen table and the append positions, so the
-/// staging would read them from memory. The misses of a slice take a few hundred kilobytes.
+/// staging would read them from memory. The misses of a slice take a few hundred kilobytes. The records of a lone
+/// `count` stay staged block by block: the repeats of a key combine into one record, and fewer of them would combine
+/// within a slice.
 constexpr size_t adaptive_argument_miss_batch_rows = 8'192;
 /// Fixed lookahead of the drain's hash prefetch.
 constexpr size_t adaptive_drain_prefetch_look_ahead = 16;
