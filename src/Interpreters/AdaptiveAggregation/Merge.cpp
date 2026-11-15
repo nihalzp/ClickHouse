@@ -1144,12 +1144,49 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     const size_t partitions_per_bucket = layout.partitionsPerBucket();
 
     AdaptiveBucketRecords staged(session, bucket);
-    std::vector<size_t> partition_records(partitions_per_bucket);
+    const std::vector<size_t> partition_records = staged.recordsOfPartitions(partitions_per_bucket);
     size_t bucket_records = 0;
     for (size_t sub = 0; sub < partitions_per_bucket; ++sub)
-    {
-        partition_records[sub] = staged.recordsOf(sub);
         bucket_records += partition_records[sub];
+
+    /// The threshold of the top-K that the aggregation feeds, which every conversion of the merge reads and
+    /// tightens (see `AdaptiveTopKThreshold`). Only the external merge of a top-K goes without it, and that
+    /// merge outputs partial states.
+    AdaptiveTopKThreshold * const threshold = session.top_k_threshold.get();
+    chassert(threshold || !final || !params.bucket_top_k);
+    AdaptiveTopKPruning * const pruning = session.top_k_pruning.get();
+    chassert(!pruning || threshold);
+
+    /// A bucket bounded below the threshold holds no group of the top (see `AdaptiveTopKPruning::bucketBound`), so
+    /// it goes unread: its records are freed, and its source cells are left as they are unless their states have
+    /// destructors to run. The merge takes the buckets with the largest bounds first, so once the threshold has
+    /// passed the bound of a bucket, every later bucket takes this path. It spares the bucket the bounds of its bins,
+    /// which sum 1,024 bins of every producer, and the walk over its source cells in every producer's table.
+    if (pruning && pruning->bucketBound(bucket) < threshold->current())
+    {
+        if constexpr (MapAggregationMethod<Method>)
+        {
+            if (!is_simple_count && !all_aggregates_has_trivial_destructor)
+                for (size_t i = 1; i < data.size(); ++i)
+                    forEachCellOfSourceBucket<Method>(
+                        *data[i], layout, bucket, [&](const auto &, AggregateDataPtr & mapped, size_t) { discardAdaptiveSourceState(mapped); });
+        }
+        staged.release(0, partitions_per_bucket);
+
+        bool pruned = bucket_records > 0;
+        for (size_t i = 1; i < data.size() && !pruned; ++i)
+            pruned = sourceBucketSize<Method>(*data[i], layout, bucket) > 0;
+        if (pruned)
+            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationPrunedUnits);
+        if (bucket_records)
+            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationPrunedRecords, bucket_records);
+
+        for (size_t i = 1; i < data.size(); ++i)
+            if (data[i]->isTwoLevel())
+                getDataVariant<Method>(*data[i]).data.impls[bucket].clearAndShrink();
+        arena_slot.reset();
+        ProfileEvents::increment(ProfileEvents::AdaptiveAggregationBucketsRetired);
+        return {};
     }
 
     size_t source_cells = 0;
@@ -1163,16 +1200,8 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     const size_t partitions_per_unit = partitions_per_bucket / units;
     const AdaptiveUnitSourceCells<Method> unit_source_cells(data, layout, bucket, units);
 
-    /// The threshold of the top-K that the aggregation feeds, which every conversion of the merge reads and
-    /// tightens (see `AdaptiveTopKThreshold`). Only the external merge of a top-K goes without it, and that
-    /// merge outputs partial states.
-    AdaptiveTopKThreshold * const threshold = session.top_k_threshold.get();
-    chassert(threshold || !final || !params.bucket_top_k);
-
     /// With the top-K pruning, the bounds of the bucket's count bins (see `AdaptiveTopKPruning`), completed with the
     /// groups of the tables of the producers that never froze.
-    AdaptiveTopKPruning * const pruning = session.top_k_pruning.get();
-    chassert(!pruning || threshold);
     AdaptiveTopKPruning::BucketBounds bin_bounds{};
     if (pruning)
     {
@@ -1230,10 +1259,13 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
         }
         if (skip)
         {
+            /// States without destructors leave nothing to do in the source cells, which no one reads again.
             if constexpr (MapAggregationMethod<Method>)
-                for_each_cell([&](const auto &, AggregateDataPtr * mapped, size_t) { discardAdaptiveSourceState(*mapped); });
-            for (size_t sub = unit_first_sub; sub < unit_end_sub; ++sub)
-                staged.release(sub);
+            {
+                if (!is_simple_count && !all_aggregates_has_trivial_destructor)
+                    for_each_cell([&](const auto &, AggregateDataPtr * mapped, size_t) { discardAdaptiveSourceState(*mapped); });
+            }
+            staged.release(unit_first_sub, unit_end_sub);
             pruned_records += unit_records;
             ProfileEvents::increment(ProfileEvents::AdaptiveAggregationPrunedUnits);
             continue;
@@ -1376,9 +1408,10 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     if (pruned_records)
         ProfileEvents::increment(ProfileEvents::AdaptiveAggregationPrunedRecords, pruned_records);
 
-    /// Every source cell of the bucket was adopted, merged or discarded and its mapped value nulled, so the bucket tables
-    /// of two-level sources only release their buffers. A single-level source keeps its one buffer, which its destruction
-    /// frees after the last bucket of the merge stopped the source owning states (see `AdaptiveBucketMergingSource`).
+    /// Every source cell of the bucket was adopted, merged or discarded, or left by a skipped unit with states that need
+    /// no destructor, so the bucket tables of two-level sources only release their buffers. A single-level source keeps
+    /// its one buffer, which is freed after the last bucket of the merge stopped the source owning states (see
+    /// `releaseAdaptiveMergeSources`).
     for (size_t i = 1; i < data.size(); ++i)
         if (data[i]->isTwoLevel())
             getDataVariant<Method>(*data[i]).data.impls[bucket].clearAndShrink();
