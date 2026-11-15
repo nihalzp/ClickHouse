@@ -35,6 +35,10 @@ namespace DB
 /// reaches the threshold, such as one of few groups or one held to its K best keys by the `GROUP BY` top-K, would
 /// otherwise slice every block, and the extra calls cost a few percent of the aggregation.
 constexpr size_t adaptive_learning_slicing_row_multiple = 16;
+/// A slice of a learning block is never shorter than this many rows: the floor bounds the dispatches that a table
+/// hovering just below a freeze bound can spend per block, and in exchange the freeze can overshoot the bound by at
+/// most this many keys.
+constexpr size_t adaptive_learning_slice_rows = 4'096;
 /// The first rows that a learning table takes are a trial of whether its keys repeat. Past them the table freezes as
 /// soon as fewer than one of its rows in `adaptive_bypass_hit_rate_inverse` repeated a key it holds, the hit rate
 /// below which a frozen table is not worth probing. Almost every key such a table would learn occurs once in its

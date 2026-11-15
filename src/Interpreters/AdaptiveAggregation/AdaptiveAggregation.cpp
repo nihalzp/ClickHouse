@@ -195,12 +195,6 @@ std::optional<size_t> AdaptiveAggregationProducer::expectedRows() const
     return *expected_rows / started;
 }
 
-bool Aggregator::adaptiveEarlyFreezePaysFor(const AdaptiveAggregationProducer & adaptive)
-{
-    const auto expected_rows = adaptive.expectedRows();
-    return expected_rows && adaptiveEarlyFreezePays(*expected_rows, adaptive.received_rows, adaptive.session->layout.numPartitions());
-}
-
 AdaptiveAggregationSessionPtr Aggregator::createAdaptiveSession(size_t producers, QueryStatusPtr process_list_element) const
 {
     const auto layout = AdaptivePartitionLayout::forProducers(producers, params.max_bytes_before_external_group_by);
@@ -257,36 +251,49 @@ bool Aggregator::adaptiveLearningSlices(const AdaptiveAggregationProducer & adap
         <= adaptive_learning_slicing_row_multiple * params.adaptive_aggregator_freeze_threshold;
 }
 
+AdaptiveFreezeBounds Aggregator::adaptiveFreezeBounds(const AdaptiveAggregationProducer & adaptive) const
+{
+    return AdaptiveFreezeBounds(
+        params.adaptive_aggregator_freeze_threshold,
+        adaptive.session->early_freeze_threshold,
+        adaptive.expectedRows(),
+        adaptive.received_rows,
+        adaptive.session->layout.numPartitions());
+}
+
+std::optional<AdaptiveFreezeBounds> Aggregator::adaptiveSlicingFreezeBounds(
+    const AggregatedDataVariants & result, const AdaptiveAggregationProducer * adaptive, size_t rows, bool all_keys_are_const) const
+{
+    if (!adaptive || !adaptive->isLearning() || !result.isConvertibleToTwoLevel() || !adaptiveLearningSlices(*adaptive))
+        return {};
+    /// A block of constant keys adds at most one key, and the check between blocks handles it.
+    if (all_keys_are_const)
+        return {};
+    const auto bounds = adaptiveFreezeBounds(*adaptive);
+    const size_t learned_rows = std::get<AdaptiveAggregationProducer::LearningState>(adaptive->phase).rows;
+    if (!bounds.reachableWithin(result.sizeWithoutOverflowRow(), learned_rows, rows))
+        return {};
+    return bounds;
+}
+
 bool Aggregator::adaptiveFreezeBoundReached(const AggregatedDataVariants & result, const AdaptiveAggregationProducer & adaptive) const
 {
+    if (!result.isConvertibleToTwoLevel())
+        return false;
+
     /// The byte twin of the key-count bound is the table's hash-table buffer: the cells that every probe walks, hits and
     /// misses alike, so it keeps a table with wide cells cache-resident. The memory of the states is no bound: it grows
     /// through the keys that the table already holds, which a freeze does not stop, and freezing a few groups with
     /// growing states would only stage the rest of the stream. It is checked between blocks, so a byte-triggered freeze
-    /// lands on a block boundary; the mid-block freeze crossing checks only the key count. The memory of the whole
+    /// lands on a block boundary; the slicer of a block checks only the key counts. The memory of the whole
     /// aggregation is no bound either: it sums the allocations of every thread, including the blocks they are
     /// processing, so the growth of some tables would freeze the others.
-    const bool freeze_bytes_reached = params.adaptive_aggregator_freeze_threshold_bytes
-        && result.hashTableBufferBytes() >= params.adaptive_aggregator_freeze_threshold_bytes;
-    const size_t keys = result.sizeWithoutOverflowRow();
-    if (!result.isConvertibleToTwoLevel())
-        return false;
-    if (keys >= params.adaptive_aggregator_freeze_threshold || freeze_bytes_reached)
+    if (params.adaptive_aggregator_freeze_threshold_bytes
+        && result.hashTableBufferBytes() >= params.adaptive_aggregator_freeze_threshold_bytes)
         return true;
 
-    /// The bounds of an early freeze. The shared threshold freezes a table whose freeze pays for itself, or which is
-    /// on track to the whole threshold anyway: its freeze is then only moved forward. The trial freezes a table only
-    /// where the freeze pays: keys that do not repeat gain from staging only in bulk.
-    const auto expected_rows = adaptive.expectedRows();
-    if (!expected_rows)
-        return false;
-    const bool pays = adaptiveEarlyFreezePays(*expected_rows, adaptive.received_rows, adaptive.session->layout.numPartitions());
     const size_t learned_rows = std::get<AdaptiveAggregationProducer::LearningState>(adaptive.phase).rows;
-    if (keys >= adaptive.session->early_freeze_threshold)
-        return pays
-            || adaptiveLearningReachesThreshold(
-                keys, learned_rows, *expected_rows, adaptive.received_rows, params.adaptive_aggregator_freeze_threshold);
-    return pays && adaptiveLearningFindsNoRepeats(learned_rows, keys);
+    return adaptiveFreezeBounds(adaptive).reached(result.sizeWithoutOverflowRow(), learned_rows);
 }
 
 bool Aggregator::adaptiveStagingWorthSpilling(const AdaptiveAggregationProducer & adaptive) const

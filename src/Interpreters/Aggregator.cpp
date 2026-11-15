@@ -111,13 +111,6 @@ namespace ErrorCodes
 
 namespace
 {
-/// A learning block that can cross the adaptive freeze threshold runs in slices, so the
-/// crossing is detected inside the block instead of after up to a whole block of overshoot.
-/// A slice is never shorter than this many rows: the floor bounds the dispatches a table
-/// hovering just below the threshold can spend per block, and in exchange the freeze can
-/// overshoot the threshold by at most this many keys.
-constexpr size_t adaptive_learning_slice_rows = 4'096;
-
 /// The widest light aggregation state, in bytes: two words, such as the sum and the count of `avg` over
 /// 64-bit numbers. A wider state is heavy, and so is one whose destructor frees memory (see
 /// `Aggregator::hasHeavyStates`).
@@ -1425,38 +1418,29 @@ size_t Aggregator::executeImplUntilAdaptiveFreeze(
     size_t row_end,
     ColumnRawPtrs & key_columns,
     AggregateFunctionInstruction * aggregate_instructions,
-    const AdaptiveAggregationProducer & adaptive) const
+    const AdaptiveFreezeBounds & freeze_bounds,
+    size_t learned_rows) const
 {
-    /// The rows that the table took before this block, which count toward its trial.
-    const size_t learned_rows = std::get<AdaptiveAggregationProducer::LearningState>(adaptive.phase).rows;
-    /// Whether the table may freeze early in this block: judged once, with the block's rows as received.
-    const bool may_freeze_early = adaptiveEarlyFreezePaysFor(adaptive);
-    const size_t threshold = may_freeze_early ? adaptive.session->early_freeze_threshold : params.adaptive_aggregator_freeze_threshold;
-
     const auto dispatch = [&](auto & method, LastElementCacheStats & cache_stats) -> size_t
     {
         using Method = std::decay_t<decltype(method)>;
 
-        /// One slice at a time until the table stands at the threshold: the shortest slice
-        /// that can get it there, floored so a table hovering just below cannot degrade the
-        /// block into row-sized dispatches (the floor is also the overshoot bound). A slice
-        /// also ends with the trial of the table's first rows, so a table whose keys do not
-        /// repeat freezes right there. The per-slice `after_slice` keeps the consecutive-keys
-        /// cache statistics exact: `executeImplBatch` resets the cache on entry, so the misses
-        /// must be collected slice by slice, not once at the end.
+        /// One slice at a time until the table stands at a freeze bound: each slice is the
+        /// shortest that can get it to the next bound (see `AdaptiveFreezeBounds::rowsToNextCheck`).
+        /// The per-slice `after_slice` keeps the consecutive-keys cache statistics exact:
+        /// `executeImplBatch` resets the cache on entry, so the misses must be collected slice
+        /// by slice, not once at the end.
         const auto run_slices = [&](auto & state, auto && after_slice) -> size_t
         {
             size_t pos = row_begin;
             while (pos < row_end)
             {
-                const size_t table_size = method.data.size();
+                const size_t keys = method.data.size();
                 const size_t rows = learned_rows + (pos - row_begin);
-                if (table_size >= threshold || (may_freeze_early && adaptiveLearningFindsNoRepeats(rows, table_size)))
+                if (freeze_bounds.reached(keys, rows))
                     return pos;
 
-                size_t slice = std::min(row_end - pos, std::max(threshold - table_size, adaptive_learning_slice_rows));
-                if (may_freeze_early && rows < adaptive_learning_trial_rows)
-                    slice = std::min(slice, adaptive_learning_trial_rows - rows);
+                const size_t slice = std::min(row_end - pos, freeze_bounds.rowsToNextCheck(keys, rows));
                 executeImpl(
                     method,
                     state,
@@ -2659,24 +2643,24 @@ bool Aggregator::executeOnBlock(Columns columns,
             columns, row_begin, row_end, result, key_columns, aggregate_functions_instructions.data(), *adaptive, all_keys_are_const,
             aggregator_tracker ? result.memory_tracker.get() : nullptr);
     }
-    else if (adaptive && adaptive->isLearning() && result.isConvertibleToTwoLevel() && !all_keys_are_const
-             && (result.sizeWithoutOverflowRow() + (row_end - row_begin) > adaptive->session->early_freeze_threshold
-                 || std::get<AdaptiveAggregationProducer::LearningState>(adaptive->phase).rows < adaptive_learning_trial_rows)
-             && adaptiveLearningSlices(*adaptive))
+    else if (const auto freeze_bounds = adaptiveSlicingFreezeBounds(result, adaptive, row_end - row_begin, all_keys_are_const))
     {
-        /// The learning adaptive path, taken when this block can push the table past the freeze
-        /// threshold or falls in the trial of the table's first rows, and the table still slices
-        /// its blocks (see `adaptiveLearningSlices`): the same aggregation as below, but in
-        /// slices, so the crossing is detected inside the block instead of overshooting by up to
-        /// a block of new keys - everything above the threshold is state the frozen table would
-        /// replicate on every worker - and so the trial ends on a slice boundary. The
-        /// slicer only reports the boundary; the transition is decided here. A const block
-        /// stays on the baseline path: it adds at most one key, and the between-blocks check
-        /// handles it. The admission gate rules out the dropping overflow modes and the
-        /// overflow row, so `no_more_keys` can never become true, which is what entitles the
-        /// slices to pass `no_more_keys = false` and no overflow destination.
+        /// The learning adaptive path, taken when this block can take the table to a freeze bound
+        /// (see `adaptiveSlicingFreezeBounds`): the same aggregation as below, but in slices, so
+        /// the bound is noticed inside the block instead of overshooting by up to a block of new
+        /// keys - everything above the bound is state the frozen table would replicate on every
+        /// worker. The slicer only reports the boundary; the transition is made here. The
+        /// admission gate rules out the dropping overflow modes and the overflow row, so
+        /// `no_more_keys` can never become true, which is what entitles the slices to pass
+        /// `no_more_keys = false` and no overflow destination.
         const size_t split = executeImplUntilAdaptiveFreeze(
-            result, row_begin, row_end, key_columns, aggregate_functions_instructions.data(), *adaptive);
+            result,
+            row_begin,
+            row_end,
+            key_columns,
+            aggregate_functions_instructions.data(),
+            *freeze_bounds,
+            std::get<AdaptiveAggregationProducer::LearningState>(adaptive->phase).rows);
         if (split < row_end)
         {
             std::optional<MemoryTrackerSwitcher> scope;

@@ -948,23 +948,21 @@ private:
         bool all_keys_are_const,
         AggregateDataPtr overflow_row) const;
 
-    /// The learning consume path of the adaptive aggregation, taken for a block that can push
-    /// the table past a freeze threshold or that falls in the trial of the table's first rows:
-    /// aggregates like `executeImpl`, but in slices, and stops at the first row where the table
-    /// stands at or past its threshold (the slicing gets it there with at most a slice of
-    /// overshoot). The threshold is `adaptive_aggregator_freeze_threshold`. While an early
-    /// freeze pays for itself (see `adaptiveEarlyFreezePaysFor`), it is the lower threshold of
-    /// an early freeze, and the table also stops where the trial finds that the keys do not
-    /// repeat (see `adaptiveLearningFindsNoRepeats`; a slice ends where the trial does).
-    /// Returns that boundary, or `row_end` when the block finished with the table still
-    /// learning; the transition and the routing of the rest of the block belong to the caller.
+    /// The learning consume path of the adaptive aggregation, taken for a block that can take
+    /// the table to a freeze bound (see `adaptiveSlicingFreezeBounds`): aggregates like
+    /// `executeImpl`, but in slices, and stops at the first slice boundary at which the table,
+    /// which learned from `learned_rows` rows before the block, has reached a bound of
+    /// `freeze_bounds` (the slicing gets it there with at most a slice of overshoot). Returns
+    /// that boundary, or `row_end` when the block finished with the table still learning; the
+    /// transition and the routing of the rest of the block belong to the caller.
     size_t executeImplUntilAdaptiveFreeze(
         AggregatedDataVariants & result,
         size_t row_begin,
         size_t row_end,
         ColumnRawPtrs & key_columns,
         AggregateFunctionInstruction * aggregate_instructions,
-        const AdaptiveAggregationProducer & adaptive) const;
+        const AdaptiveFreezeBounds & freeze_bounds,
+        size_t learned_rows) const;
 
     /// Specialization for a particular value no_more_keys.
     template <bool prefetch, bool top_k = false, typename Method, typename State>
@@ -1027,19 +1025,24 @@ private:
     bool advanceAdaptiveProducer(
         AggregatedDataVariants & result, AdaptiveAggregationProducer & adaptive, size_t rows, bool over_external_threshold) const;
 
-    /// Whether a learning table reached a bound of the freeze. Two bounds freeze it whatever follows: the key count
-    /// `adaptive_aggregator_freeze_threshold` and the bytes of its hash-table buffer (see
-    /// `AggregatedDataVariants::hashTableBufferBytes`). Two more freeze it early, and only when the query tells how
-    /// many rows to expect. The key count of the session's `early_freeze_threshold` does while the freeze pays for
-    /// itself (see `adaptiveEarlyFreezePays`) or the table is on track to the whole threshold anyway (see
-    /// `adaptiveLearningReachesThreshold`). The end of a trial in which its keys did not repeat (see
-    /// `adaptiveLearningFindsNoRepeats`) does only while the freeze pays for itself.
-    bool adaptiveFreezeBoundReached(const AggregatedDataVariants & result, const AdaptiveAggregationProducer & adaptive) const;
+    /// The bounds at which the learning table of the producer freezes, by the rows that the producer received and
+    /// expects now (see `AdaptiveFreezeBounds`).
+    AdaptiveFreezeBounds adaptiveFreezeBounds(const AdaptiveAggregationProducer & adaptive) const;
 
-    /// Whether a freeze of the producer's table before the whole threshold pays for itself now (see
-    /// `adaptiveEarlyFreezePays`), by the rows that the producer expects (see
-    /// `AdaptiveAggregationProducer::expectedRows`).
-    static bool adaptiveEarlyFreezePaysFor(const AdaptiveAggregationProducer & adaptive);
+    /// The freeze bounds of a learning table for a block of `rows` rows that has to be taken in slices (see
+    /// `executeImplUntilAdaptiveFreeze`), or nothing when the block is aggregated whole: the producer is not
+    /// learning, its table no longer slices its blocks (see `adaptiveLearningSlices`), the keys of the block are
+    /// constant, or the block cannot take the table to a bound.
+    std::optional<AdaptiveFreezeBounds> adaptiveSlicingFreezeBounds(
+        const AggregatedDataVariants & result,
+        const AdaptiveAggregationProducer * adaptive,
+        size_t rows,
+        bool all_keys_are_const) const;
+
+    /// Whether a learning table reached a bound of the freeze between two blocks: one of its freeze bounds (see
+    /// `AdaptiveFreezeBounds`), or the bytes of its hash-table buffer (see
+    /// `AggregatedDataVariants::hashTableBufferBytes`), which freeze it whatever rows follow.
+    bool adaptiveFreezeBoundReached(const AggregatedDataVariants & result, const AdaptiveAggregationProducer & adaptive) const;
 
     /// Whether the top-K pruning can take the adaptive merge of an aggregation in which no producer froze (see
     /// `mergePrunesByTopK`): only where it skips the merge of heavy states.
