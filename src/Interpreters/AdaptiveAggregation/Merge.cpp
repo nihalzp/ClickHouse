@@ -1460,7 +1460,8 @@ void Aggregator::releaseAdaptiveMergeSources(ManyAggregatedDataVariants & data, 
     if (session.top_k_pruning)
         bins = session.top_k_pruning->takeProducerBins();
 
-    /// Item `i` is what one producer left: source `i + 1`, an arena, a buffer and the bins.
+    /// Item `i` is the `i`-th of each kind, about what one producer left: a source table, an arena, a staging buffer
+    /// and the bins of a producer.
     const size_t items = std::max({data.size() - 1, pools.size(), buffers.size(), bins.size()});
     std::atomic<size_t> next_item = 0;
     const auto release = [&]
