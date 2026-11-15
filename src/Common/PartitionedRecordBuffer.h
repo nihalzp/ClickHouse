@@ -159,6 +159,10 @@ private:
     /// The cold path of `append`: closes the partition's current chunk and starts one that holds `bytes`.
     NO_INLINE void startChunk(size_t partition, size_t bytes);
 
+    /// Gives back `references` references to `block`: that of its carver, or those of chunks carved from it. The block
+    /// is freed with its last reference, and then leaves `live_allocations`.
+    void releaseBlock(Block * block, UInt32 references = 1);
+
     /// Ends the claims on the blocks being carved, so each block is freed with its last chunk. The groups
     /// keep their totals: appends resumed after `finishAppending` continue the growth of their blocks.
     void releaseCurrentBlocks();
@@ -175,9 +179,10 @@ private:
     std::unique_ptr<Chain[]> chains;
     std::vector<Carver> carvers;
     size_t allocated_chunk_bytes = 0;
-    /// The blocks and the chunks allocated on their own that are not freed yet. The appending thread adds them, and
-    /// the consumers subtract a block when its last chunk is released, which happens once per block rather than once
-    /// per partition. `clear` skips its walk over the partitions when none is left.
+    /// The blocks and the chunks allocated on their own that are not freed yet. The appending thread counts each one
+    /// where it allocates it, and whoever frees one counts it out: a consumer does for a block when it releases the
+    /// last chunk of the block, which happens once per block rather than once per partition. `clear` skips its walk
+    /// over the partitions when none is left.
     std::atomic<size_t> live_allocations{0};
 };
 

@@ -22,33 +22,27 @@ namespace ErrorCodes
 
 struct alignas(CH_CACHE_LINE_SIZE) PartitionedRecordBuffer::Block
 {
-    Block(size_t bytes_, std::atomic<size_t> & live_allocations_) : bytes(bytes_), live_allocations(live_allocations_)
-    {
-        live_allocations.fetch_add(1, std::memory_order_relaxed);
-    }
+    explicit Block(size_t bytes_) : bytes(bytes_) {}
 
     /// One reference for the carver while it carves from the block, and one per chunk carved and not yet released.
     std::atomic<UInt32> references{1};
     /// The size of the block's allocation. Blocks differ in size, since the blocks of a group grow.
     const size_t bytes;
-    /// The count of the owning buffer's live allocations (see `PartitionedRecordBuffer::live_allocations`).
-    std::atomic<size_t> & live_allocations;
 
     /// Counts a chunk carved from the block. Only the appending thread changes the count while it appends: consumers
     /// release chunks after `finishAppending`, and appends resume once they finish. So the count takes no locked
     /// instruction, which would wait for the stores of the appends to drain at every chunk.
     void addChunk() { references.store(references.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
 
-    /// Gives back the references of `chunks` chunks of the block.
-    void release(UInt32 chunks = 1)
+    /// Gives back `count` references, and frees the block with the last one. Returns whether it freed the block.
+    bool release(UInt32 count)
     {
-        if (references.fetch_sub(chunks, std::memory_order_acq_rel) == chunks)
-        {
-            const size_t allocated = bytes;
-            live_allocations.fetch_sub(1, std::memory_order_release);
-            this->~Block();
-            Allocator<false, false>().free(this, allocated, alignof(Block));
-        }
+        if (references.fetch_sub(count, std::memory_order_acq_rel) != count)
+            return false;
+        const size_t allocated = bytes;
+        this->~Block();
+        Allocator<false, false>().free(this, allocated, alignof(Block));
+        return true;
     }
 };
 
@@ -87,12 +81,18 @@ void PartitionedRecordBuffer::clear()
     allocated_chunk_bytes = 0;
 }
 
+void PartitionedRecordBuffer::releaseBlock(Block * block, UInt32 references)
+{
+    if (block->release(references))
+        live_allocations.fetch_sub(1, std::memory_order_release);
+}
+
 void PartitionedRecordBuffer::releaseCurrentBlocks()
 {
     for (auto & carver : carvers)
     {
         if (carver.block)
-            carver.block->release();
+            releaseBlock(carver.block);
         carver.pos = nullptr;
         carver.remaining = 0;
         carver.block = nullptr;
@@ -146,8 +146,9 @@ void PartitionedRecordBuffer::startChunk(size_t partition, size_t bytes)
             const size_t block_size = std::max(nextBlockBytes(group), sizeof(Block) + needed);
             char * memory = static_cast<char *>(Allocator<false, false>().alloc(block_size, alignof(Block)));
             if (carver.block)
-                carver.block->release();
-            carver.block = new (memory) Block(block_size, live_allocations);
+                releaseBlock(carver.block);
+            carver.block = new (memory) Block(block_size);
+            live_allocations.fetch_add(1, std::memory_order_relaxed);
             carver.pos = memory + sizeof(Block);
             carver.remaining = block_size - sizeof(Block);
             carver.allocated_block_bytes += block_size;
@@ -190,25 +191,49 @@ void PartitionedRecordBuffer::finishAppending()
 
 void PartitionedRecordBuffer::releasePartitions(size_t first_partition, size_t count)
 {
-    /// Other threads wrote the counters of the blocks last, and a locked decrement waits for its cache line and holds
-    /// back the loads after it. So the walk along the chains only notes the blocks of the chunks, prefetches their
-    /// counters, and decrements a batch of them together, once for all the chunks that the batch found in a block.
+    /// The blocks of the chunks that the walk has passed, each with the number of those chunks, whose references are
+    /// given back together. Other threads wrote the counters of the blocks last, and a locked decrement waits for its
+    /// cache line and holds back the loads after it. So a block's counter is prefetched when the walk first meets the
+    /// block and decremented once, with the rest of the batch, for all the chunks that the batch found in the block.
     /// For example, the first chunks of the 8 partitions of a bucket usually sit in one block of their group, which
-    /// then takes one decrement instead of 8. The blocks outlive the decrements of the batch that they need: a chunk
-    /// further along a chain holds a reference to its block until the walk has read it.
-    struct BlockChunks
+    /// then takes one decrement instead of 8. A block outlives the batch that names it: a chunk further along a
+    /// chain holds a reference to its block until the walk has passed it.
+    struct ReleaseBatch
     {
-        Block * block;
-        UInt32 chunks;
+        struct BlockChunks
+        {
+            Block * block;
+            UInt32 chunks;
+        };
+
+        PartitionedRecordBuffer & buffer;
+        std::array<BlockChunks, release_batch_blocks> blocks;
+        size_t size = 0;
+
+        void addChunkOf(Block * block)
+        {
+            for (size_t i = 0; i < size; ++i)
+            {
+                if (blocks[i].block == block)
+                {
+                    ++blocks[i].chunks;
+                    return;
+                }
+            }
+            if (size == blocks.size())
+                release();
+            __builtin_prefetch(block, /*rw=*/1);
+            blocks[size++] = {block, 1};
+        }
+
+        void release()
+        {
+            for (size_t i = 0; i < size; ++i)
+                buffer.releaseBlock(blocks[i].block, blocks[i].chunks);
+            size = 0;
+        }
     };
-    std::array<BlockChunks, release_batch_blocks> batch;
-    size_t batched = 0;
-    const auto release_batch = [&]
-    {
-        for (size_t i = 0; i < batched; ++i)
-            batch[i].block->release(batch[i].chunks);
-        batched = 0;
-    };
+    ReleaseBatch batch{.buffer = *this, .blocks = {}};
 
     /// The appending thread wrote the headers of the chunks long ago, so the walk prefetches the first chunk of the
     /// partitions ahead.
@@ -226,20 +251,7 @@ void PartitionedRecordBuffer::releasePartitions(size_t first_partition, size_t c
             ChunkHeader * const next = chunk->next;
             if (Block * const block = chunk->block)
             {
-                size_t i = 0;
-                while (i < batched && batch[i].block != block)
-                    ++i;
-                if (i < batched)
-                {
-                    ++batch[i].chunks;
-                }
-                else
-                {
-                    if (batched == batch.size())
-                        release_batch();
-                    __builtin_prefetch(block, /*rw=*/1);
-                    batch[batched++] = {block, 1};
-                }
+                batch.addChunkOf(block);
             }
             else
             {
@@ -251,7 +263,7 @@ void PartitionedRecordBuffer::releasePartitions(size_t first_partition, size_t c
         chains[partition] = {};
         cursors[partition] = {};
     }
-    release_batch();
+    batch.release();
 }
 
 }
