@@ -12,6 +12,7 @@
 #include <Interpreters/Aggregator.h>
 #include <Interpreters/HashTablesStatistics.h>
 #include <Interpreters/ProcessList.h>
+#include <base/sort.h>
 
 namespace ProfileEvents
 {
@@ -376,9 +377,27 @@ void Aggregator::finishAdaptiveProducer(AggregatedDataVariants & local_variants,
     std::array<UInt64, ADAPTIVE_AGGREGATION_NUM_BUCKETS> max_count_per_bucket_storage{};
     auto * const max_count_per_bucket = !count_bins && adaptiveTopKPrunesWithoutFreeze() ? &max_count_per_bucket_storage : nullptr;
 
+    /// A descending top-K takes a floor from the producer's own table: the rank of a group in the table counts only
+    /// what this producer aggregated into it, so the group's final rank is at least that, and the
+    /// `bucket_top_k`-th largest rank of the table is one that `bucket_top_k` groups reach. For example, with a top
+    /// 10 by `count`, a table whose tenth largest count is 500 proves that ten groups have 500 rows or more. The
+    /// merge's threshold starts from the largest floor of the producers instead of zero, so the units that every
+    /// merge task merges first, before any unit is converted, already skip the count bins bounded below it.
+    PaddedPODArray<UInt64> rank_counts;
+    const bool finds_top_k_floor = params.bucket_top_k && !params.bucket_top_k_ascending;
+
     size_t estimated_merge_work = adaptive.total_staged_records * adaptive_parallel_merge_indices.size();
-    if (count_bins || max_count_per_bucket || !adaptive_parallel_merge_indices.empty())
-        estimated_merge_work += collectAdaptiveTableStatistics(local_variants, count_bins, max_count_per_bucket);
+    if (count_bins || max_count_per_bucket || finds_top_k_floor || !adaptive_parallel_merge_indices.empty())
+        estimated_merge_work += collectAdaptiveTableStatistics(
+            local_variants, count_bins, max_count_per_bucket, finds_top_k_floor ? &rank_counts : nullptr);
+
+    UInt64 top_k_floor = 0;
+    if (rank_counts.size() >= params.bucket_top_k)
+    {
+        const auto floor = rank_counts.begin() + (params.bucket_top_k - 1);
+        ::nth_element(rank_counts.begin(), floor, rank_counts.end(), std::greater<>());
+        top_k_floor = *floor;
+    }
 
     std::optional<AdaptiveTopKPruning::ProducerBins> bins;
     if (count_bins)
@@ -401,6 +420,7 @@ void Aggregator::finishAdaptiveProducer(AggregatedDataVariants & local_variants,
     shared.estimated_merge_work += estimated_merge_work;
     ++shared.finished_producers;
     shared.table_cells += local_variants.sizeWithoutOverflowRow();
+    shared.top_k_floor = std::max(shared.top_k_floor, top_k_floor);
     if (froze)
     {
         ++shared.frozen_producers;
@@ -442,8 +462,8 @@ void Aggregator::prepareAdaptiveTopK(
     std::optional<UInt64> best_possible_rank;
     if (params.bucket_top_k_ascending && !collects_statistics)
         best_possible_rank = bucket_top_k_min_rank;
-    shared.top_k_threshold
-        = std::make_unique<AdaptiveTopKThreshold>(params.bucket_top_k, params.bucket_top_k_ascending, best_possible_rank);
+    shared.top_k_threshold = std::make_unique<AdaptiveTopKThreshold>(
+        params.bucket_top_k, params.bucket_top_k_ascending, best_possible_rank, shared.top_k_floor);
 }
 
 bool Aggregator::mergePrunesByTopK(
