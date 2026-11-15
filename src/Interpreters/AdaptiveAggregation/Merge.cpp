@@ -1173,53 +1173,31 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     AdaptiveTopKPruning * const pruning = session.top_k_pruning.get();
     chassert(!pruning || threshold);
 
-    /// A bucket bounded below the threshold holds no group of the top (see `AdaptiveTopKPruning::bucketBound`), so
-    /// it goes unread: its records are freed, and its source cells are left as they are unless their states have
-    /// destructors to run. The merge takes the buckets with the largest bounds first, so once the threshold has
-    /// passed the bound of a bucket, every later bucket takes this path. It spares the bucket the bounds of its bins,
-    /// which sum 1,024 bins of every producer, and the walk over its source cells in every producer's table.
-    if (pruning && pruning->bucketBound(bucket) < threshold->current())
-    {
-        if constexpr (MapAggregationMethod<Method>)
-        {
-            if (!is_simple_count && !all_aggregates_has_trivial_destructor)
-                for (size_t i = 1; i < data.size(); ++i)
-                    forEachCellOfSourceBucket<Method>(
-                        *data[i], layout, bucket, [&](const auto &, AggregateDataPtr & mapped, size_t) { discardAdaptiveSourceState(mapped); });
-        }
-        staged.release(0, partitions_per_bucket);
-
-        bool pruned = bucket_records > 0;
-        for (size_t i = 1; i < data.size() && !pruned; ++i)
-            pruned = sourceBucketSize<Method>(*data[i], layout, bucket) > 0;
-        if (pruned)
-            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationPrunedUnits);
-        if (bucket_records)
-            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationPrunedRecords, bucket_records);
-
-        for (size_t i = 1; i < data.size(); ++i)
-            if (data[i]->isTwoLevel())
-                getDataVariant<Method>(*data[i]).data.impls[bucket].clearAndShrink();
-        arena_slot.reset();
-        ProfileEvents::increment(ProfileEvents::AdaptiveAggregationBucketsRetired);
-        return {};
-    }
-
-    size_t source_cells = 0;
-    for (size_t i = 1; i < data.size(); ++i)
-        source_cells += sourceBucketSize<Method>(*data[i], layout, bucket);
+    /// A bucket bounded below the threshold holds no group of the top (see `AdaptiveTopKPruning::bucketBound`), so the
+    /// merge skips it whole. That spares the bucket the bounds of its bins, which sum 1,024 bins of every producer.
+    /// The merge takes the buckets with the largest bounds first, so once the threshold has passed the bound of a
+    /// bucket, it is above the bounds of the buckets that follow.
+    const bool skips_bucket = pruning && pruning->bucketBound(bucket) < threshold->current();
 
     /// A unit is a run of partitions; the bucket splits into as many as give each unit about
-    /// `adaptive_merge_unit_records` records and source cells, at most one per partition.
-    const size_t units = std::min(
-        partitions_per_bucket, std::bit_ceil(std::max<size_t>(1, (bucket_records + source_cells) / adaptive_merge_unit_records)));
+    /// `adaptive_merge_unit_records` records and source cells, at most one per partition. A bucket that is skipped
+    /// is one unit.
+    size_t units = 1;
+    if (!skips_bucket)
+    {
+        size_t source_cells = 0;
+        for (size_t i = 1; i < data.size(); ++i)
+            source_cells += sourceBucketSize<Method>(*data[i], layout, bucket);
+        units = std::min(
+            partitions_per_bucket, std::bit_ceil(std::max<size_t>(1, (bucket_records + source_cells) / adaptive_merge_unit_records)));
+    }
     const size_t partitions_per_unit = partitions_per_bucket / units;
     const AdaptiveUnitSourceCells<Method> unit_source_cells(data, layout, bucket, units);
 
     /// With the top-K pruning, the bounds of the bucket's count bins (see `AdaptiveTopKPruning`), completed with the
     /// groups of the tables of the producers that never froze.
     AdaptiveTopKPruning::BucketBounds bin_bounds{};
-    if (pruning)
+    if (pruning && !skips_bucket)
     {
         bin_bounds = pruning->boundsForBucket(bucket);
         addMergeCountedTablesToBounds<Method>(data, layout, bucket, *pruning, bin_bounds, arena);
@@ -1260,12 +1238,12 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
             continue;
         const auto for_each_cell = [&](auto && callback) { unit_source_cells.forEach(unit, callback); };
 
-        /// A settled threshold skips every unit left (see `AdaptiveTopKThreshold`). Otherwise the pruning
-        /// keeps the unit's bins that can still hold a group of the top, at the threshold of the moment (see
-        /// `AdaptiveTopKPruning::selectUnit`): a unit with none is skipped, its source cells dropped and its records freed
-        /// unread; a unit with some drains only theirs.
+        /// A settled threshold skips every unit left (see `AdaptiveTopKThreshold`), and a bucket below the threshold
+        /// is skipped as its one unit. Otherwise the pruning keeps the unit's bins that can still hold a group of the
+        /// top, at the threshold of the moment (see `AdaptiveTopKPruning::selectUnit`): a unit with none is skipped,
+        /// its source cells dropped and its records freed unread; a unit with some drains only theirs.
         const bool * alive_bins = nullptr;
-        bool skip = threshold && threshold->settled();
+        bool skip = skips_bucket || (threshold && threshold->settled());
         if (pruning && !skip)
         {
             const auto selection = pruning->selectUnit(bin_bounds, unit, units, threshold->current(), alive);
