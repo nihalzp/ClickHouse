@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -34,6 +35,21 @@ namespace DB
 /// reaches the threshold, such as one of few groups or one held to its K best keys by the `GROUP BY` top-K, would
 /// otherwise slice every block, and the extra calls cost a few percent of the aggregation.
 constexpr size_t adaptive_learning_slicing_row_multiple = 16;
+/// The first rows that a learning table takes are a trial of whether its keys repeat. Past them the table freezes as
+/// soon as fewer than one of its rows in `adaptive_bypass_hit_rate_inverse` repeated a key it holds, the hit rate
+/// below which a frozen table is not worth probing. Almost every key such a table would learn occurs once in its
+/// stream, and each of them costs a cell, its place in the cell index and its adoption by the merge for nothing. For
+/// example, a table that took 4,096 rows and holds 3,500 keys saw 596 repeats, fewer than 1,024, and freezes at
+/// 3,500 keys.
+constexpr size_t adaptive_learning_trial_rows = 4'096;
+/// Up to this many producers each learning table takes the whole `adaptive_aggregator_freeze_threshold`. More
+/// producers share that many thresholds between them (see `adaptiveEarlyFreezeThreshold`).
+constexpr size_t adaptive_full_freeze_threshold_producers = 64;
+/// A freeze has a fixed cost: every partition that the producer stages into takes a first chunk, and the merge
+/// visits every partition of every producer. So a freeze before the whole `adaptive_aggregator_freeze_threshold`
+/// pays for itself only while its producer is expected to receive at least this many more rows per partition of the
+/// layout (see `adaptiveEarlyFreezePays`). With 2,048 partitions that is 32,768 rows.
+constexpr size_t adaptive_early_freeze_rows_per_partition = 16;
 /// The probe bypass decides after this many post-freeze rows per thread. It must be reachable
 /// by every stream: at 64 threads a thread sees 1/64th of the input, so a filtered ~13M-row
 /// aggregation still leaves ~200K rows per thread.
@@ -146,14 +162,67 @@ constexpr size_t adaptive_thaw_min_state_bytes_per_key = 75;
 constexpr size_t adaptive_thaw_min_pruned_bin_divisor = 8;
 constexpr size_t adaptive_thaw_pruned_share_inverse = 2;
 
+/// The number of keys at which each of `producers` learning tables freezes early (see
+/// `Aggregator::adaptiveFreezeBoundReached`), out of a freeze threshold of `threshold` keys. Every producer learns the
+/// keys of its table from the first rows it sees, so the producers together learn their number times the threshold
+/// in keys, whatever the size of the aggregation. With 192 producers and 16,384 keys each that is 3.1 million keys,
+/// and when a filter leaves 13 million rows, a quarter of them go through the learning tables. A key that many
+/// producers hold has a state in each of them for the merge to combine, which costs most where the states are heavy,
+/// as those of `uniqExact` are. So above `adaptive_full_freeze_threshold_producers` producers the tables share that
+/// many thresholds: 192 producers take 5,461 keys each.
+inline size_t adaptiveEarlyFreezeThreshold(size_t threshold, size_t producers)
+{
+    if (producers <= adaptive_full_freeze_threshold_producers)
+        return threshold;
+    return threshold * adaptive_full_freeze_threshold_producers / producers;
+}
+
+/// Whether a learning table that took `rows` rows and holds `keys` keys ends its learning because its keys do not
+/// repeat: past the trial of `adaptive_learning_trial_rows` rows, when fewer than one row in
+/// `adaptive_bypass_hit_rate_inverse` repeated a key of the table.
+inline bool adaptiveLearningFindsNoRepeats(size_t rows, size_t keys)
+{
+    if (rows < adaptive_learning_trial_rows)
+        return false;
+    const size_t repeats = rows > keys ? rows - keys : 0;
+    return repeats * adaptive_bypass_hit_rate_inverse < rows;
+}
+
+/// Whether an early freeze pays for its fixed cost: the producer, which received `received_rows` rows of the
+/// `expected_rows` it expects in all, expects at least `adaptive_early_freeze_rows_per_partition` more rows per
+/// partition of the layout. For example, with 2,048 partitions a producer that received 10,000 rows freezes early
+/// only if it expects 42,768 rows or more.
+inline bool adaptiveEarlyFreezePays(size_t expected_rows, size_t received_rows, size_t partitions)
+{
+    return expected_rows >= received_rows + adaptive_early_freeze_rows_per_partition * partitions;
+}
+
+/// Whether a learning table is on track to `threshold` keys, at which it freezes whatever follows, so that an early
+/// freeze adds no freeze to the aggregation. The table holds `keys` keys after it learned from `learned_rows` rows,
+/// and its producer received `received_rows` rows of the `expected_rows` it expects in all. The rows to come bring
+/// new keys at the rate of the rows learned from, at most: keys repeat more as a table fills. For example, a table
+/// that holds 5,600 keys after 8,000 rows and expects 30,000 more rows is on track for
+/// 5,600 + 30,000 * 5,600 / 8,000 = 26,600 keys, past a threshold of 16,384.
+inline bool adaptiveLearningReachesThreshold(
+    size_t keys, size_t learned_rows, size_t expected_rows, size_t received_rows, size_t threshold)
+{
+    chassert(learned_rows >= keys && keys > 0);
+    const size_t remaining_rows = expected_rows > received_rows ? expected_rows - received_rows : 0;
+    return keys + static_cast<size_t>(static_cast<UInt128>(remaining_rows) * keys / learned_rows) >= threshold;
+}
+
 struct AdaptiveAggregationSession
 {
     AdaptiveAggregationSession(
         size_t producers_,
+        size_t early_freeze_threshold_,
+        QueryStatusPtr process_list_element_,
         AdaptivePartitionLayout layout_,
         TemporaryDataOnDiskScopePtr spill_scope_,
         std::unique_ptr<AdaptiveTopKPruning> top_k_pruning_)
         : producers(producers_)
+        , early_freeze_threshold(early_freeze_threshold_)
+        , process_list_element(std::move(process_list_element_))
         , layout(layout_)
         , spill_scope(std::move(spill_scope_))
         , top_k_pruning(std::move(top_k_pruning_))
@@ -181,6 +250,25 @@ struct AdaptiveAggregationSession
 
     /// The number of producers: the pipeline's aggregation streams.
     const size_t producers;
+
+    /// The number of keys at which a producer's learning table freezes early (see `adaptiveEarlyFreezeThreshold`).
+    /// It is at most `adaptive_aggregator_freeze_threshold`, at which a table freezes whatever follows.
+    const size_t early_freeze_threshold;
+
+    /// The query, for the progress of its reading. Null outside a query, as in unit tests.
+    const QueryStatusPtr process_list_element;
+
+    /// The rows that the producers received so far, which every producer adds for each of its blocks, and the
+    /// producers that received any.
+    std::atomic<size_t> received_rows = 0;
+    std::atomic<size_t> started_producers = 0;
+
+    /// The rows that the aggregation is expected to receive in total: `received_rows` divided by the share of the
+    /// query's input that is read so far. For example, 2 million rows received when 20 of 100 million rows are read
+    /// make 10 million. Nothing when the query does not report the rows it will read, as with sources of unknown
+    /// size. The estimate assumes that the aggregation receives its rows in step with the reading, so it is too low
+    /// when most of the reading comes before the aggregation's first row, as the build side of a join does.
+    std::optional<size_t> expectedRows() const;
 
     /// Every producer uses the layout chosen for the pipeline's aggregation streams.
     const AdaptivePartitionLayout layout;
@@ -532,6 +620,14 @@ struct AdaptiveAggregationProducer
     void standDown() { phase = BaselineState{}; }
 
     AdaptiveAggregationSessionPtr session;
+
+    /// The rows that this producer received so far, in every phase.
+    size_t received_rows = 0;
+
+    /// The rows that this producer is expected to receive in all: its even share of the rows that the aggregation
+    /// expects (see `AdaptiveAggregationSession::expectedRows`). Nothing when the query does not tell how many rows
+    /// to expect, so its table then freezes at the ordinary bounds only.
+    std::optional<size_t> expectedRows() const;
 
     /// The records this producer staged, created by its freeze; a producer that stands down keeps them for the
     /// merge. Handed over to the session when the producer finishes.
