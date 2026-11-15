@@ -483,8 +483,9 @@ struct AdaptiveAggregationProducer
     /// under memory pressure learns again from empty.
     struct LearningState
     {
-        /// Rows that the table took while learning, which end the slicing of its blocks (see
-        /// `adaptive_learning_slicing_row_multiple`).
+        /// Rows that the table took while learning. They end the slicing of its blocks (see
+        /// `adaptive_learning_slicing_row_multiple`), and the bounds of an early freeze weigh the table's keys against
+        /// them (see `AdaptiveFreezeBounds`).
         size_t rows = 0;
     };
 
@@ -585,6 +586,10 @@ struct AdaptiveAggregationProducer
     bool isLearning() const { return std::holds_alternative<LearningState>(phase); }
     bool isFrozen() const { return std::holds_alternative<FrozenState>(phase); }
     bool isBaseline() const { return std::holds_alternative<BaselineState>(phase); }
+
+    /// The rows that the learning table took (see `LearningState::rows`). The caller guarantees that the producer is
+    /// learning.
+    size_t learnedRows() const { return std::get<LearningState>(phase).rows; }
 
     void freeze(size_t used_arena_bytes_at_freeze, size_t memory_usage_at_freeze)
     {

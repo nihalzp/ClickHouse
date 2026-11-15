@@ -246,8 +246,7 @@ bool Aggregator::adaptiveLearningSlices(const AdaptiveAggregationProducer & adap
 {
     /// `<=` keeps the first block sliced even under a zero threshold, where the slicer freezes the table at its
     /// first row.
-    return std::get<AdaptiveAggregationProducer::LearningState>(adaptive.phase).rows
-        <= adaptive_learning_slicing_row_multiple * params.adaptive_aggregator_freeze_threshold;
+    return adaptive.learnedRows() <= adaptive_learning_slicing_row_multiple * params.adaptive_aggregator_freeze_threshold;
 }
 
 AdaptiveFreezeBounds Aggregator::adaptiveFreezeBounds(const AdaptiveAggregationProducer & adaptive) const
@@ -269,8 +268,7 @@ std::optional<AdaptiveFreezeBounds> Aggregator::adaptiveSlicingFreezeBounds(
     if (all_keys_are_const)
         return {};
     const auto bounds = adaptiveFreezeBounds(*adaptive);
-    const size_t learned_rows = std::get<AdaptiveAggregationProducer::LearningState>(adaptive->phase).rows;
-    if (!bounds.reachableWithin(result.sizeWithoutOverflowRow(), learned_rows, rows))
+    if (!bounds.reachableWithin(result.sizeWithoutOverflowRow(), adaptive->learnedRows(), rows))
         return {};
     return bounds;
 }
@@ -291,8 +289,7 @@ bool Aggregator::adaptiveFreezeBoundReached(const AggregatedDataVariants & resul
         && result.hashTableBufferBytes() >= params.adaptive_aggregator_freeze_threshold_bytes)
         return true;
 
-    const size_t learned_rows = std::get<AdaptiveAggregationProducer::LearningState>(adaptive.phase).rows;
-    return adaptiveFreezeBounds(adaptive).reached(result.sizeWithoutOverflowRow(), learned_rows);
+    return adaptiveFreezeBounds(adaptive).reached(result.sizeWithoutOverflowRow(), adaptive.learnedRows());
 }
 
 bool Aggregator::adaptiveStagingWorthSpilling(const AdaptiveAggregationProducer & adaptive) const
@@ -392,7 +389,7 @@ void Aggregator::finishAdaptiveProducer(AggregatedDataVariants & local_variants,
     /// units that every merge task merges first, before any unit is converted, already skip the count bins bounded
     /// below it. A table with fewer than `bucket_top_k` groups leaves its threshold at zero, which is no floor.
     std::optional<AdaptiveTopKThreshold> table_threshold;
-    if (params.bucket_top_k && !params.bucket_top_k_ascending)
+    if (params.adaptiveTopKPrunes())
         table_threshold.emplace(params.bucket_top_k, /*ascending_=*/false, /*best_possible_rank_=*/std::nullopt);
 
     size_t estimated_merge_work = adaptive.total_staged_records * adaptive_parallel_merge_indices.size();

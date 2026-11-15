@@ -2654,7 +2654,7 @@ bool Aggregator::executeOnBlock(Columns columns,
             key_columns,
             aggregate_functions_instructions.data(),
             *freeze_bounds,
-            std::get<AdaptiveAggregationProducer::LearningState>(adaptive->phase).rows);
+            adaptive->learnedRows());
         if (split < row_end)
         {
             std::optional<MemoryTrackerSwitcher> scope;
