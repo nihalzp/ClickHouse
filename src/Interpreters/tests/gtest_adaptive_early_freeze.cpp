@@ -1,4 +1,4 @@
-#include <Interpreters/AdaptiveAggregation/AdaptiveAggregationImpl.h>
+#include <Interpreters/AdaptiveAggregation/AdaptiveFreezeBounds.h>
 
 #include <gtest/gtest.h>
 

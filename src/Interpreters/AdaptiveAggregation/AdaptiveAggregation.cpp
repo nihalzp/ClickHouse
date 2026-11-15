@@ -9,6 +9,7 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/AdaptiveAggregation/AdaptiveAggregationImpl.h>
+#include <Interpreters/AdaptiveAggregation/AdaptiveFreezeBounds.h>
 #include <Interpreters/Aggregator.h>
 #include <Interpreters/HashTablesStatistics.h>
 #include <Interpreters/ProcessList.h>
