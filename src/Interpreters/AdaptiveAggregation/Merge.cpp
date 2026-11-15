@@ -1428,7 +1428,14 @@ void Aggregator::releaseAdaptiveMergeTable(ManyAggregatedDataVariants & data, co
     if (task.previous_bucket < 0)
         return;
     /// The conversion of the task's last unit emptied the table and kept its buffer.
-    visitTwoLevelVariant(*data[0], [&](auto & method) { method.data.impls[task.previous_bucket].clearAndShrink(); });
+    visitTwoLevelVariant(
+        *data[0],
+        [&](auto & method)
+        {
+            auto & table = method.data.impls[task.previous_bucket];
+            chassert(table.empty());
+            table.clearAndShrink();
+        });
 }
 
 void Aggregator::releaseAdaptiveMergeSources(ManyAggregatedDataVariants & data, AdaptiveAggregationSession & session) const

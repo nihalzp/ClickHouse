@@ -37,7 +37,9 @@ struct alignas(CH_CACHE_LINE_SIZE) PartitionedRecordBuffer::Block
     /// Gives back `count` references, and frees the block with the last one. Returns whether it freed the block.
     bool release(UInt32 count)
     {
-        if (references.fetch_sub(count, std::memory_order_acq_rel) != count)
+        const UInt32 held = references.fetch_sub(count, std::memory_order_acq_rel);
+        chassert(held >= count);
+        if (held != count)
             return false;
         const size_t allocated = bytes;
         this->~Block();
@@ -71,11 +73,13 @@ void PartitionedRecordBuffer::clear()
     /// The carvers drop their claims first, so only chunks hold the blocks. Every chunk is either carved from a block
     /// or allocated on its own, and both count as live allocations. With none left, no partition holds a chunk: the
     /// consumers released them all, which also reset their chains and cursors. The walk over the partitions is then
-    /// skipped. It matters because the buffers of many producers with thousands of partitions each are destroyed by
-    /// one thread after the merge.
+    /// skipped. It matters because a merge that released every partition leaves the buffers of many producers, with
+    /// thousands of partitions each, to be destroyed.
     releaseCurrentBlocks();
     if (live_allocations.load(std::memory_order_acquire))
         releasePartitions(0, num_partitions);
+    chassert(!live_allocations.load(std::memory_order_relaxed));
+    chassert(std::none_of(chains.get(), chains.get() + num_partitions, [](const Chain & chain) { return chain.first; }));
     for (auto & carver : carvers)
         carver.allocated_block_bytes = 0;
     allocated_chunk_bytes = 0;
