@@ -93,7 +93,7 @@ private:
 /// group whose bin is bounded below the merge's threshold, the worst of the `n` best exact counts converted so far (see
 /// `AdaptiveTopKThreshold`), has `n` groups ahead of it, so the merge skips the units, staged records and source cells
 /// of such bins without draining them. The merge takes the buckets with the largest bounds first, so the threshold
-/// rises early.
+/// rises early, and it skips a bucket whole once the threshold is above the bound of the bucket (see `bucketBound`).
 class AdaptiveTopKPruning
 {
 public:
@@ -211,12 +211,9 @@ private:
     std::vector<AdaptiveTopKCountBins> producer_bins;
     std::vector<const AggregatedDataVariants *> merge_counted_tables;
     /// The sum of every producer's largest bin in each bucket and of the bucket's largest count in every table
-    /// that the merge counts and that brought it, which orders the buckets for the merge. It bounds the count
-    /// of every group of the bucket when every such table brought its largest counts: a bucket's largest bin
-    /// is at most the sum of the producers' largest bins in it, and a group of the bucket counts at most the
-    /// sum of the largest counts of the bucket in those tables.
+    /// that the merge counts and that brought it. It orders the buckets for the merge (see `orderBuckets`), and it
+    /// bounds the ranks of the groups of every bucket but those of `bucket_is_unbounded` (see `bucketBound`).
     std::array<UInt64, ADAPTIVE_AGGREGATION_NUM_BUCKETS> count_bound_per_bucket{};
-    /// The buckets for which `count_bound_per_bucket` bounds nothing (see `bucketBound`).
     std::array<bool, ADAPTIVE_AGGREGATION_NUM_BUCKETS> bucket_is_unbounded{};
     std::array<UInt8, ADAPTIVE_AGGREGATION_NUM_BUCKETS> bucket_order{};
 };
