@@ -2516,15 +2516,9 @@ bool Aggregator::executeOnBlock(Columns columns,
     /// `result` will destroy the states of aggregate functions in the destructor
     result.aggregator = this;
 
-    /// Every producer counts its rows, whatever its phase, for the estimate of the rows that the aggregation receives
-    /// in total (see `AdaptiveAggregationSession::expectedRows`).
+    /// Every producer counts its rows, whatever its phase.
     if (adaptive && row_end > row_begin)
-    {
-        if (!adaptive->received_rows)
-            adaptive->session->started_producers.fetch_add(1, std::memory_order_relaxed);
-        adaptive->received_rows += row_end - row_begin;
-        adaptive->session->received_rows.fetch_add(row_end - row_begin, std::memory_order_relaxed);
-    }
+        adaptive->addReceivedRows(row_end - row_begin);
 
     /// How to perform the aggregation?
     if (result.empty())

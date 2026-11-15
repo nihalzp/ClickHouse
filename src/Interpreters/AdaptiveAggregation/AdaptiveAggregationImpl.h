@@ -596,6 +596,16 @@ struct AdaptiveAggregationProducer
     /// The rows that this producer received so far, in every phase.
     size_t received_rows = 0;
 
+    /// Counts the `rows` rows of a block that the producer receives, for itself and for the session's estimate of the
+    /// rows that the aggregation receives in total (see `AdaptiveAggregationSession::expectedRows`).
+    void addReceivedRows(size_t rows)
+    {
+        if (!received_rows)
+            session->started_producers.fetch_add(1, std::memory_order_relaxed);
+        received_rows += rows;
+        session->received_rows.fetch_add(rows, std::memory_order_relaxed);
+    }
+
     /// The rows that this producer is expected to receive in all: its even share of the rows that the aggregation
     /// expects (see `AdaptiveAggregationSession::expectedRows`). Nothing when the query does not tell how many rows
     /// to expect, so its table then freezes at the ordinary bounds only.
