@@ -2027,10 +2027,6 @@ void AggregatingTransform::initGenerate()
         {
             AdaptiveAggregationSession * session = adaptive_context ? adaptive_context->session.get() : nullptr;
             auto prepared_data = params->aggregator.prepareVariantsToMerge(std::move(many_data->variants), session);
-            /// The adaptive bucket merge frees the tables of the producers itself, in parallel, once its last bucket
-            /// merged (see `Aggregator::releaseAdaptiveMergeSources`), so it holds the only references to them.
-            if (bucket_merge)
-                many_data->variants.clear();
             auto prepared_data_ptr = std::make_shared<ManyAggregatedDataVariants>(std::move(prepared_data));
             /// The producers of the session estimated the merge work, also when none of them froze and the tables merge
             /// partition by partition.

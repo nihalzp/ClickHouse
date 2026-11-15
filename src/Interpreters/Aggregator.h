@@ -533,10 +533,10 @@ public:
     /// Ends the sources of an adaptive in-memory merge of `data` once every bucket merged, and frees what the producers
     /// left: the source tables with their cell indexes and arenas, the staging buffers and the count bins of the top-K
     /// pruning. Every bucket took the states out of its source cells, so the source tables stop owning states and
-    /// their destruction only frees memory. The caller guarantees that `data` holds the only references to the
-    /// source tables, and that no merge task reads the sources any more. With many producers the work is spread over
-    /// the thread pool: one thread would otherwise free everything at the end of the query, which with 192 producers
-    /// takes several milliseconds.
+    /// their destruction only frees memory. `data` is the result of `prepareVariantsToMerge`, which made it the only
+    /// owner of the source tables. The caller guarantees that no merge task reads the sources any more. With many
+    /// producers the work is spread over the thread pool: one thread would otherwise free everything at the end of
+    /// the query, which with 192 producers takes several milliseconds.
     void releaseAdaptiveMergeSources(ManyAggregatedDataVariants & data, AdaptiveAggregationSession & session) const;
 
     /// The destination of the adaptive merge: an empty two-level variants of the aggregation's method with an arena slot
@@ -652,7 +652,9 @@ public:
 
     /// `adaptive_session` (or nullptr when the adaptive aggregation is off) puts the destination of the adaptive merge
     /// in front of the tables when the session is engaged. It also gives the adaptive verdict of the run to the
-    /// hash-table statistics.
+    /// hash-table statistics. The adaptive bucket merge takes the tables over and leaves `data_variants` empty,
+    /// because it frees them itself (see `releaseAdaptiveMergeSources`). Every other merge shares them with the
+    /// caller, which keeps `data_variants` as it was.
     ManyAggregatedDataVariants prepareVariantsToMerge(
         ManyAggregatedDataVariants && data_variants, AdaptiveAggregationSession * adaptive_session) const;
 
