@@ -90,7 +90,25 @@ public:
 
     /// Releases the partition's chunks and resets its cursor. Consumers may release distinct partitions
     /// concurrently, after `finishAppending`.
-    void releasePartition(size_t partition);
+    void releasePartition(size_t partition) { releasePartitions(partition, 1); }
+
+    /// Releases the chunks of the `count` consecutive partitions from `first_partition` on, and resets their cursors.
+    /// The chunks of consecutive partitions often share blocks, and the chunks of one block give their references back
+    /// with one decrement of its counter. Consumers may release distinct partitions concurrently, after
+    /// `finishAppending`.
+    void releasePartitions(size_t first_partition, size_t count);
+
+    /// Prefetches what `releasePartitions` reads first for the same partitions, for a caller that releases the same
+    /// partitions of many buffers in a row.
+    ALWAYS_INLINE void prefetchRelease(size_t first_partition, size_t count) const
+    {
+        const char * chain = reinterpret_cast<const char *>(&chains[first_partition]);
+        for (size_t offset = 0; offset < count * sizeof(Chain); offset += prefetch_stride)
+            __builtin_prefetch(chain + offset, /*rw=*/1);
+        const char * cursor = reinterpret_cast<const char *>(&cursors[first_partition]);
+        for (size_t offset = 0; offset < count * sizeof(Cursor); offset += prefetch_stride)
+            __builtin_prefetch(cursor + offset, /*rw=*/1);
+    }
 
     /// The total capacity of chunks allocated since construction or `clear`. This counts chunk headers and
     /// padding, excludes unused block capacity, and is not reduced by concurrent partition releases.
@@ -101,8 +119,12 @@ public:
 
 private:
     static constexpr size_t max_block_bytes = 256 << 10;
-    /// The chunks whose block counters `releasePartition` prefetches before it decrements them.
-    static constexpr size_t release_batch_chunks = 16;
+    /// The blocks whose counters `releasePartitions` prefetches before it decrements them.
+    static constexpr size_t release_batch_blocks = 16;
+    /// How many partitions ahead `releasePartitions` prefetches the header of a partition's first chunk.
+    static constexpr size_t release_prefetch_partitions = 8;
+    /// The distance between two prefetches of an array: a cache line.
+    static constexpr size_t prefetch_stride = 64;
 
     struct Block;
     struct ChunkHeader;

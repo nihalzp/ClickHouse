@@ -39,9 +39,10 @@ struct alignas(CH_CACHE_LINE_SIZE) PartitionedRecordBuffer::Block
     /// instruction, which would wait for the stores of the appends to drain at every chunk.
     void addChunk() { references.store(references.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
 
-    void release()
+    /// Gives back the references of `chunks` chunks of the block.
+    void release(UInt32 chunks = 1)
     {
-        if (references.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        if (references.fetch_sub(chunks, std::memory_order_acq_rel) == chunks)
         {
             const size_t allocated = bytes;
             live_allocations.fetch_sub(1, std::memory_order_release);
@@ -80,8 +81,7 @@ void PartitionedRecordBuffer::clear()
     /// one thread after the merge.
     releaseCurrentBlocks();
     if (live_allocations.load(std::memory_order_acquire))
-        for (size_t partition = 0; partition < num_partitions; ++partition)
-            releasePartition(partition);
+        releasePartitions(0, num_partitions);
     for (auto & carver : carvers)
         carver.allocated_block_bytes = 0;
     allocated_chunk_bytes = 0;
@@ -188,40 +188,70 @@ void PartitionedRecordBuffer::finishAppending()
     releaseCurrentBlocks();
 }
 
-void PartitionedRecordBuffer::releasePartition(size_t partition)
+void PartitionedRecordBuffer::releasePartitions(size_t first_partition, size_t count)
 {
     /// Other threads wrote the counters of the blocks last, and a locked decrement waits for its cache line and holds
-    /// back the loads after it. The walk along the chain prefetches the counters of a batch of chunks and decrements
-    /// them after the batch, so their cache lines arrive together. The blocks outlive the decrements of the batch
-    /// that they need: a chunk further along the chain holds a reference to its block, and a block that the batch
-    /// names twice holds a reference for each.
-    std::array<Block *, release_batch_chunks> batch{};
-    size_t batched = 0;
-    for (ChunkHeader * chunk = chains[partition].first; chunk;)
+    /// back the loads after it. So the walk along the chains only notes the blocks of the chunks, prefetches their
+    /// counters, and decrements a batch of them together, once for all the chunks that the batch found in a block.
+    /// For example, the first chunks of the 8 partitions of a bucket usually sit in one block of their group, which
+    /// then takes one decrement instead of 8. The blocks outlive the decrements of the batch that they need: a chunk
+    /// further along a chain holds a reference to its block until the walk has read it.
+    struct BlockChunks
     {
-        ChunkHeader * const next = chunk->next;
-        if (Block * const block = chunk->block)
+        Block * block;
+        UInt32 chunks;
+    };
+    std::array<BlockChunks, release_batch_blocks> batch;
+    size_t batched = 0;
+    const auto release_batch = [&]
+    {
+        for (size_t i = 0; i < batched; ++i)
+            batch[i].block->release(batch[i].chunks);
+        batched = 0;
+    };
+
+    /// The appending thread wrote the headers of the chunks long ago, so the walk prefetches the first chunk of the
+    /// partitions ahead.
+    const size_t end_partition = first_partition + count;
+    for (size_t partition = first_partition; partition < std::min(end_partition, first_partition + release_prefetch_partitions); ++partition)
+        __builtin_prefetch(chains[partition].first);
+
+    for (size_t partition = first_partition; partition < end_partition; ++partition)
+    {
+        if (partition + release_prefetch_partitions < end_partition)
+            __builtin_prefetch(chains[partition + release_prefetch_partitions].first);
+
+        for (ChunkHeader * chunk = chains[partition].first; chunk;)
         {
-            __builtin_prefetch(block, /*rw=*/1);
-            batch[batched++] = block;
-            if (batched == batch.size())
+            ChunkHeader * const next = chunk->next;
+            if (Block * const block = chunk->block)
             {
-                for (Block * const batched_block : batch)
-                    batched_block->release();
-                batched = 0;
+                size_t i = 0;
+                while (i < batched && batch[i].block != block)
+                    ++i;
+                if (i < batched)
+                {
+                    ++batch[i].chunks;
+                }
+                else
+                {
+                    if (batched == batch.size())
+                        release_batch();
+                    __builtin_prefetch(block, /*rw=*/1);
+                    batch[batched++] = {block, 1};
+                }
             }
+            else
+            {
+                Allocator<false, false>().free(chunk, chunk->capacity);
+                live_allocations.fetch_sub(1, std::memory_order_release);
+            }
+            chunk = next;
         }
-        else
-        {
-            Allocator<false, false>().free(chunk, chunk->capacity);
-            live_allocations.fetch_sub(1, std::memory_order_release);
-        }
-        chunk = next;
+        chains[partition] = {};
+        cursors[partition] = {};
     }
-    for (size_t i = 0; i < batched; ++i)
-        batch[i]->release();
-    chains[partition] = {};
-    cursors[partition] = {};
+    release_batch();
 }
 
 }
