@@ -524,6 +524,12 @@ public:
         RuntimeDataflowStatisticsCacheUpdaterPtr updater,
         size_t * merged_group_count) const;
 
+    /// Frees the table that `task` kept from the bucket it merged last (see `mergeAndConvertAdaptiveBucket`), once
+    /// the task has no bucket left to merge. The kept tables would otherwise wait for the destruction of the
+    /// destination, which one thread does at the end of the query: it frees the table of every task, and where the
+    /// states have destructors it first walks all their cells for states to destroy, although every cell is empty.
+    void releaseAdaptiveMergeTable(ManyAggregatedDataVariants & data, const AdaptiveMergeTask & task) const;
+
     /// The destination of the adaptive merge: an empty two-level variants of the aggregation's method with an arena slot
     /// per bucket, which holds the arena in which the merge creates the states of the bucket's unit. For a merge that goes
     /// external because producers wrote tables to disk (on the baseline path, or frozen ones), the staged records

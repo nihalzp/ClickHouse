@@ -1382,6 +1382,14 @@ Aggregator::AggregatedChunks Aggregator::mergeAndConvertAdaptiveBucketImpl(
     return chunks;
 }
 
+void Aggregator::releaseAdaptiveMergeTable(ManyAggregatedDataVariants & data, const AdaptiveMergeTask & task) const
+{
+    if (task.previous_bucket < 0)
+        return;
+    /// The conversion of the task's last unit emptied the table and kept its buffer.
+    visitTwoLevelVariant(*data[0], [&](auto & method) { method.data.impls[task.previous_bucket].clearAndShrink(); });
+}
+
 AggregatedDataVariantsPtr Aggregator::createAdaptiveMergeDestination() const
 {
     auto destination = std::make_shared<AggregatedDataVariants>();

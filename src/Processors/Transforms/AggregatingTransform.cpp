@@ -234,7 +234,10 @@ namespace
             }
 
             if (chunks.empty())
+            {
+                params->aggregator.releaseAdaptiveMergeTable(*destination, task);
                 return {};
+            }
 
             auto agg_chunk = std::move(chunks.front());
             chunks.pop_front();
@@ -470,6 +473,7 @@ protected:
             const UInt32 claim = shared_data->next_bucket_to_merge.fetch_add(1);
             if (claim >= ConvertingAggregatedToChunksWithMergingSource::NUM_BUCKETS)
             {
+                params->aggregator.releaseAdaptiveMergeTable(*data, task);
                 data.reset();
                 return {};
             }

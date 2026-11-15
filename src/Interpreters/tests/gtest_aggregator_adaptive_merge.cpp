@@ -16,6 +16,7 @@
 
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 
 using namespace DB;
@@ -231,6 +232,81 @@ TEST_P(AggregatorAdaptiveMerge, SourceStateLifetimes)
 
 INSTANTIATE_TEST_SUITE_P(MergePaths, AggregatorAdaptiveMerge,
     ::testing::Combine(::testing::Values(MergeMode::Batch, MergeMode::Pairwise, MergeMode::Group), ::testing::Bool()));
+
+/// A merge task keeps the table of the bucket it merged last, emptied, for its next bucket. Once it has no bucket
+/// left, it frees that table, so the table does not wait for the destruction of the destination. A task that merged
+/// no bucket keeps no table. Each of the two producers learns key 0 from its first row and stages the keys 1 to 100.
+/// The body runs in a thread without untracked-memory batching, so its memory tracker sees the table go.
+TEST(AggregatorAdaptiveMergeTask, FreesItsTableAtTheEnd)
+{
+    tryRegisterAggregateFunctions();
+    std::thread([]
+    {
+        ThreadStatus thread_status;
+        thread_status.untracked_memory_limit = 0;
+        const MemoryTracker & tracker = thread_status.memory_tracker;
+
+        const auto number = std::make_shared<DataTypeUInt64>();
+        const AggregateDescriptions aggregates{makeAggregate("count", {}, {}), makeAggregate("sum", {"n"}, {number})};
+        const Block header({{number->createColumn(), number, "k"}, {number->createColumn(), number, "n"}});
+        Aggregator aggregator(header, makeAdaptiveParams({"k"}, aggregates));
+
+        constexpr size_t producers = 2;
+        constexpr size_t staged_keys = 100;
+        auto session = aggregator.createAdaptiveSession(producers);
+        ManyAggregatedDataVariants sources;
+        for (size_t i = 0; i < producers; ++i)
+        {
+            auto source = std::make_shared<AggregatedDataVariants>();
+            AdaptiveAggregationProducer producer(session);
+            ColumnRawPtrs key_columns(1);
+            Aggregator::AggregateColumns aggregate_columns(aggregates.size());
+            auto key = ColumnUInt64::create();
+            auto value = ColumnUInt64::create();
+            for (size_t k = 0; k <= staged_keys; ++k)
+            {
+                key->insertValue(k);
+                value->insertValue(k);
+            }
+            bool no_more_keys = false;
+            ASSERT_TRUE(aggregator.executeOnBlock(
+                {std::move(key), std::move(value)}, 0, staged_keys + 1, *source, key_columns, aggregate_columns, no_more_keys, &producer));
+            ASSERT_TRUE(producer.isFrozen());
+            aggregator.finishAdaptiveProducer(*source, producer);
+            sources.push_back(std::move(source));
+        }
+
+        aggregator.prepareAdaptiveTopK(*session, sources.size(), /*external_merge=*/false, /*collects_statistics=*/false);
+        auto prepared = aggregator.prepareVariantsToMerge(std::move(sources), session.get());
+        AdaptiveMergeTask task;
+        std::atomic<bool> cancelled{false};
+        std::map<UInt64, std::pair<UInt64, UInt64>> groups;
+        for (size_t bucket = 0; bucket < ADAPTIVE_AGGREGATION_NUM_BUCKETS; ++bucket)
+        {
+            const auto chunks = aggregator.mergeAndConvertAdaptiveBucket(
+                prepared, *session, task, /*final=*/true, static_cast<Int32>(bucket), aggregator.parallelMergeThreshold(session.get()),
+                cancelled, /*updater=*/nullptr, /*merged_group_count=*/nullptr);
+            for (const auto & converted : chunks)
+            {
+                const auto & columns = converted.chunk.getColumns();
+                for (size_t row = 0; row < converted.chunk.getNumRows(); ++row)
+                    groups[columns[0]->getUInt(row)] = {columns[1]->getUInt(row), columns[2]->getUInt(row)};
+            }
+        }
+
+        /// Both producers add one row of every key.
+        ASSERT_EQ(groups.size(), staged_keys + 1);
+        for (const auto & [key, count_and_sum] : groups)
+            EXPECT_EQ(count_and_sum, std::make_pair(UInt64{producers}, key * producers)) << key;
+
+        const Int64 with_table = tracker.get();
+        AdaptiveMergeTask idle_task;
+        aggregator.releaseAdaptiveMergeTable(prepared, idle_task);
+        EXPECT_EQ(tracker.get(), with_table);
+        aggregator.releaseAdaptiveMergeTable(prepared, task);
+        EXPECT_LT(tracker.get(), with_table);
+    }).join();
+}
 
 /// A block whose keys are all constant reads its one key for every row. Each producer learns key `a` from its first
 /// block and freezes. Its second block, of key `b`, misses on every row and stages a record per row, each with the key.
